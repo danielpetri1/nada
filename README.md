@@ -77,3 +77,9 @@ RUST_LOG=info QLOGDIR=/root/results cargo run --release --bin quiche-server -- \
 
 Several other options are listed under `--help` to, e.g., control the log level, certificate verification, and the storing
 of secrets and responses.
+
+## Experimental Features
+
+[![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.1145/3822163.3827938)
+
+Preliminary multipath support with EPS extensions for runtime scheduler switching is available [here](https://github.com/danielpetri1/quiche/tree/nada), including experimental artifacts.
