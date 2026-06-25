@@ -82,4 +82,5 @@ of secrets and responses.
 
 [![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.1145/3822163.3827938)
 
-Preliminary multipath support with EPS extensions for runtime scheduler switching is available [here](https://github.com/danielpetri1/quiche/tree/nada), including experimental artifacts.
+Preliminary multipath support with EPS extensions for runtime scheduler switching is available [here](https://github.com/danielpetri1/quiche/tree/nada).
+Experimental artifacts are available [here](https://syncandshare.lrz.de/getlink/fiRPsUcbRK2SHQ7REDcvwv/anrw.zip).
