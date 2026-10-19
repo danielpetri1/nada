@@ -15,9 +15,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 use tokio::task;
 use tokio_quiche::buf_factory::BufFactory;
-use tokio_quiche::http3::driver::{
-    InboundFrame, InboundFrameStream, OutboundFrameSender,
-};
+use tokio_quiche::http3::driver::{InboundFrame, InboundFrameStream, OutboundFrameSender};
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::ConnectionIdGenerator;
 const CONNECTION_LEVEL_BUFFER_SIZE: u64 = 10_000_000;
@@ -75,12 +73,7 @@ struct LoggingContext {
     bytes_received: HashMap<u64, u64>,
 }
 
-fn ensure_log_file(
-    map: &mut HashMap<u64, File>,
-    id: u64,
-    file_path: String,
-    label: &str,
-) {
+fn ensure_log_file(map: &mut HashMap<u64, File>, id: u64, file_path: String, label: &str) {
     if let Entry::Vacant(e) = map.entry(id) {
         match OpenOptions::new()
             .create(true)
@@ -105,11 +98,7 @@ fn write_chunk(file: &mut File, chunk: &[u8]) {
     }
 }
 
-fn drain_h3_datagrams(
-    conn: &mut Connection,
-    logging_ctx: &mut LoggingContext,
-    flow_id: u64,
-) {
+fn drain_h3_datagrams(conn: &mut Connection, logging_ctx: &mut LoggingContext, flow_id: u64) {
     let mut buf = [0u8; BufFactory::MAX_BUF_SIZE];
 
     loop {
@@ -132,10 +121,7 @@ fn drain_h3_datagrams(
                 };
                 let payload_offset = octets.off();
                 if payload_offset > dgram.len() {
-                    log::warn!(
-                        "Invalid DATAGRAM payload offset: {}",
-                        payload_offset
-                    );
+                    log::warn!("Invalid DATAGRAM payload offset: {}", payload_offset);
                     continue;
                 }
                 let payload = retrieve_dgram(&mut dgram[payload_offset..]);
@@ -154,8 +140,7 @@ fn drain_h3_datagrams(
                     "datagram flow",
                 );
 
-                if let Some(file) = logging_ctx.dgram_map.get_mut(&dgram_flow_id)
-                {
+                if let Some(file) = logging_ctx.dgram_map.get_mut(&dgram_flow_id) {
                     write_chunk(file, payload);
                 }
             }
@@ -191,9 +176,7 @@ pub async fn quic_client(
         .parse()
         .expect("Invalid local address");
 
-    let scid = SimpleConnectionIdGenerator::new_connection_id(
-        &SimpleConnectionIdGenerator
-    );
+    let scid = SimpleConnectionIdGenerator::new_connection_id(&SimpleConnectionIdGenerator);
 
     let mut e2e_conn = quiche::connect(
         Some(&config.server_name),
@@ -211,9 +194,7 @@ pub async fn quic_client(
                 .create(true)
                 .append(true)
                 .open(&keylog_path)
-                .map_err(|e| {
-                    format!("Failed to open keylog file {}: {}", keylog_path, e)
-                })?;
+                .map_err(|e| format!("Failed to open keylog file {}: {}", keylog_path, e))?;
             e2e_conn.set_keylog(Box::new(keylog_file));
         }
     }
@@ -221,9 +202,8 @@ pub async fn quic_client(
     if config.qlog {
         if let Some(ref results_dir) = config.results_dir {
             let qlog_file_path = format!("{}/e2e-{:?}.qlog", results_dir, scid);
-            let qlog_file = File::create(&qlog_file_path).map_err(|e| {
-                format!("Failed to create qlog file {}: {}", qlog_file_path, e)
-            })?;
+            let qlog_file = File::create(&qlog_file_path)
+                .map_err(|e| format!("Failed to create qlog file {}: {}", qlog_file_path, e))?;
             e2e_conn.set_qlog(
                 Box::new(qlog_file),
                 "e2e-h3".to_string(),
@@ -349,15 +329,9 @@ pub async fn quic_client(
                         let headers = vec![
                             h3::Header::new(b":method", b"GET"),
                             h3::Header::new(b":scheme", b"https"),
-                            h3::Header::new(
-                                b":authority",
-                                config.server_name.as_bytes(),
-                            ),
+                            h3::Header::new(b":authority", config.server_name.as_bytes()),
                             h3::Header::new(b":path", config.endpoint.as_bytes()),
-                            h3::Header::new(
-                                b"priority",
-                                config.inner_prio.as_bytes(),
-                            ),
+                            h3::Header::new(b"priority", config.inner_prio.as_bytes()),
                         ];
 
                         get_request_sent = true;
@@ -372,24 +346,14 @@ pub async fn quic_client(
                             }
                         }
 
-                        handle_h3_recv(
-                            &mut e2e_conn,
-                            h3,
-                            &mut logging_ctx,
-                            &scid,
-                            flow_id,
-                        );
+                        handle_h3_recv(&mut e2e_conn, h3, &mut logging_ctx, &scid, flow_id);
                     }
                 } else {
                     log::info!("End-to-end QUIC connection established");
 
-                    let h3_config = h3::Config::new()
-                        .expect("Failed to create the HTTP/3 config");
+                    let h3_config = h3::Config::new().expect("Failed to create the HTTP/3 config");
 
-                    match h3::Connection::with_transport(
-                        &mut e2e_conn,
-                        &h3_config,
-                    ) {
+                    match h3::Connection::with_transport(&mut e2e_conn, &h3_config) {
                         Ok(h3c) => {
                             h3_conn = Some(h3c);
                             log::info!("Inner HTTP/3 connection created");
@@ -461,13 +425,7 @@ fn handle_masque_inbound_frame(
                 match e2e_conn.recv(&mut udp_payload, recv_info) {
                     Ok(_) => {
                         if let Some(ref mut h3) = h3_conn {
-                            handle_h3_recv(
-                                e2e_conn,
-                                h3,
-                                logging_ctx,
-                                scid,
-                                flow_id,
-                            );
+                            handle_h3_recv(e2e_conn, h3, logging_ctx, scid, flow_id);
                         }
                     }
                     Err(e) => {
@@ -513,7 +471,7 @@ fn handle_h3_recv(
                         "{} {}",
                         std::str::from_utf8(h.name()).unwrap_or("<non-utf8>"),
                         std::str::from_utf8(h.value()).unwrap_or("<non-utf8>")
-                    )
+                    );
                 }
             }
 
@@ -523,16 +481,9 @@ fn handle_h3_recv(
 
                 if logging_ctx.keep_resp {
                     if let Some(ref results_dir) = logging_ctx.results_dir {
-                        let file_path = format!(
-                            "{}/flow_{}_stream_{}.data",
-                            results_dir, flow_id, sid
-                        );
-                        ensure_log_file(
-                            &mut logging_ctx.resp_map,
-                            sid,
-                            file_path,
-                            "stream",
-                        );
+                        let file_path =
+                            format!("{}/flow_{}_stream_{}.data", results_dir, flow_id, sid);
+                        ensure_log_file(&mut logging_ctx.resp_map, sid, file_path, "stream");
                     }
                 }
 
@@ -544,21 +495,14 @@ fn handle_h3_recv(
                                 break 'h3_stream;
                             }
 
-                            *logging_ctx
-                                .bytes_received
-                                .entry(sid)
-                                .or_insert(0) += read as u64;
+                            *logging_ctx.bytes_received.entry(sid).or_insert(0) += read as u64;
 
                             let chunk = &buf[..read];
 
-                            log::trace!(
-                                "Received HTTP/3 body ({} bytes)",
-                                chunk.len()
-                            );
+                            log::trace!("Received HTTP/3 body ({} bytes)", chunk.len());
 
                             // Write the response, if needed
-                            if let Some(file) = logging_ctx.resp_map.get_mut(&sid)
-                            {
+                            if let Some(file) = logging_ctx.resp_map.get_mut(&sid) {
                                 write_chunk(file, chunk);
                             }
                         }
@@ -586,23 +530,14 @@ fn handle_h3_recv(
                     let duration = start_time.elapsed();
                     let duration_us = duration.as_micros();
 
-                    log::info!(
-                        "Flow {} total request time: {:.3}µs",
-                        flow_id,
-                        duration_us,
-                    );
+                    log::info!("Flow {} total request time: {:.3}µs", flow_id, duration_us,);
 
                     // Write JSON timing data to results directory if timing logging is enabled
                     if logging_ctx.log_stats {
                         if let Some(ref results_dir) = logging_ctx.results_dir {
-                            let timing_file_path = format!(
-                                "{}/e2e-{:?}.timing.json",
-                                results_dir, scid
-                            );
-                            let bytes = logging_ctx
-                                .bytes_received
-                                .remove(&sid)
-                                .unwrap_or(0);
+                            let timing_file_path =
+                                format!("{}/e2e-{:?}.timing.json", results_dir, scid);
+                            let bytes = logging_ctx.bytes_received.remove(&sid).unwrap_or(0);
                             let timing_data = json!({
                                 "flow_id": flow_id,
                                 "stream_id": sid,
@@ -610,13 +545,11 @@ fn handle_h3_recv(
                                 "bytes_received": bytes,
                             });
 
-                            if let Ok(mut file) = File::create(&timing_file_path)
-                            {
+                            if let Ok(mut file) = File::create(&timing_file_path) {
                                 if let Err(e) = writeln!(
                                     file,
                                     "{}",
-                                    serde_json::to_string_pretty(&timing_data)
-                                        .unwrap_or_default()
+                                    serde_json::to_string_pretty(&timing_data).unwrap_or_default()
                                 ) {
                                     log::warn!(
                                         "Failed to write timing data to {}: {}",
@@ -624,16 +557,10 @@ fn handle_h3_recv(
                                         e
                                     );
                                 } else {
-                                    log::debug!(
-                                        "Timing data written to {}",
-                                        timing_file_path
-                                    );
+                                    log::debug!("Timing data written to {}", timing_file_path);
                                 }
                             } else {
-                                log::warn!(
-                                    "Failed to create timing file: {}",
-                                    timing_file_path
-                                );
+                                log::warn!("Failed to create timing file: {}", timing_file_path);
                             }
                         }
                     }
@@ -672,8 +599,8 @@ fn handle_h3_recv(
 }
 
 fn e2e_quic_config(client_cfg: &E2eClientConfig) -> quiche::Config {
-    let mut qc = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .expect("Failed to create QUIC config");
+    let mut qc =
+        quiche::Config::new(quiche::PROTOCOL_VERSION).expect("Failed to create QUIC config");
 
     qc.set_application_protos(h3::APPLICATION_PROTOCOL)
         .expect("Failed setting HTTP/3 as the application protocol");

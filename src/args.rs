@@ -112,4 +112,3 @@ pub struct ProxyArgs {
     #[arg(long = "log-stats", default_value_t = false)]
     pub log_stats: bool,
 }
-

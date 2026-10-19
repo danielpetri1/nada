@@ -21,10 +21,7 @@ pub fn proxied_dgram(flow_id: u64, udp_payload: &[u8]) -> OutboundFrame {
 
     let written = octets.off();
 
-    OutboundFrame::Datagram(
-        BufFactory::dgram_buf_from_slice(&dgram[..written]),
-        flow_id,
-    )
+    OutboundFrame::Datagram(BufFactory::dgram_buf_from_slice(&dgram[..written]), flow_id)
 }
 
 /// Retrieves the UDP payload from an HTTP/3 datagram starting with a context ID of 0.

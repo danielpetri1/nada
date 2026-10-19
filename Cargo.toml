@@ -20,8 +20,8 @@ log = { version = "0.4.20" }
 tokio-quiche = { version = "0.20.1", features = ["capture_keylogs", "zero-copy", "gcongestion"]}
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 quiche = { version = "0.30.0", features = ["qlog", "gcongestion"] }
-sfv = "0.14.0"
-foundations = {version = "5.3.0", default-features = false, features = [
+sfv = "0.16.0"
+foundations = {version = "5.6.5", default-features = false, features = [
   "logging"
 ] }
 octets = "0.3.0"
