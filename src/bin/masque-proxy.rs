@@ -5,21 +5,18 @@ use nada::args::ProxyArgs;
 use nada::capsules::sfv_bool_from_header;
 use nada::capsules::{dgram_capsule_from_udp_payload, CapsuleDeframer};
 use nada::dgrams::{proxied_dgram, retrieve_dgram};
-use nada::helpers::{
-    dest_addr_from_masque_uri, flow_id_from_stream_id, sfv_bool,
-};
+use nada::helpers::{dest_addr_from_masque_uri, flow_id_from_stream_id, sfv_bool};
 use nada::prios::parse_raw_priority;
 use nada::{
-    create_results_dir, logging, write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE,
-    MAX_STREAMS,
+    create_results_dir, logging, write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS,
 };
 use nada::{MasqueTunnels, Tunnel};
 use tokio::net::UdpSocket;
 use tokio::task;
 use tokio_quiche::http3::driver::InboundFrame::{Body, Datagram};
 use tokio_quiche::http3::driver::{
-    H3Event, InboundFrameStream, IncomingH3Headers, OutboundFrame,
-    OutboundFrameSender, ServerH3Event,
+    H3Event, InboundFrameStream, IncomingH3Headers, OutboundFrame, OutboundFrameSender,
+    ServerH3Event,
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::listen;
@@ -48,8 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.common.log_keys {
         if let Some(ref results_dir) = args.common.results_dir {
-            quic_settings.keylog_file =
-                Some(format!("{}/ssl-proxy.key", results_dir));
+            quic_settings.keylog_file = Some(format!("{}/ssl-proxy.key", results_dir));
         }
     }
 
@@ -83,7 +79,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let results_dir = args.common.results_dir.clone();
 
     while let Some(conn) = accept_stream.next().await {
-
         let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
         let connection = conn?.start(driver);
 
@@ -94,11 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if log_stats {
                 if let Some(ref results_dir) = results_dir {
                     let conn_id = connection.scid();
-                    if let Err(e) = write_connection_stats(
-                        &connection,
-                        results_dir,
-                        conn_id,
-                    ) {
+                    if let Err(e) = write_connection_stats(&connection, results_dir, conn_id) {
                         log::error!("Failed to write connection stats"; "error" => ?e);
                     }
                 } else {
@@ -112,21 +103,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handle an accepted MASQUE connection.
-async fn handle_connection(
-    mut controller: ServerH3Controller
-) {
+async fn handle_connection(mut controller: ServerH3Controller) {
     let mut masque_tunnels = MasqueTunnels::new();
 
     while let Some(event) = controller.event_receiver_mut().recv().await {
         match event {
             ServerH3Event::Headers {
-                incoming_headers: IncomingH3Headers {
-                    recv,
-                    mut send,
-                    headers,
-                    stream_id,
-                    ..
-                },
+                incoming_headers:
+                    IncomingH3Headers {
+                        recv,
+                        mut send,
+                        headers,
+                        stream_id,
+                        ..
+                    },
                 ..
             } => {
                 log::info!("incoming headers"; "headers" => ?headers);
@@ -150,8 +140,7 @@ async fn handle_connection(
                         b":protocol" => protocol = Some(request_header),
 
                         b"capsule-protocol" => {
-                            capsule_protocol =
-                                Some(request_header.value().to_vec());
+                            capsule_protocol = Some(request_header.value().to_vec());
                         }
 
                         b"priority" => {
@@ -162,20 +151,17 @@ async fn handle_connection(
                     }
                 }
 
-                let reliable_masque = sfv_bool_from_header(capsule_protocol)
-                    == sfv_bool(true).as_bytes();
+                let reliable_masque =
+                    sfv_bool_from_header(capsule_protocol) == sfv_bool(true).as_bytes();
 
                 // Parse the H3 priority (u= / i) for the response stream.
                 let h3_priority = parse_raw_priority(priority.clone());
 
                 match (method, path, protocol) {
                     (Some(m), Some(target), Some(p))
-                        if m.value() == b"CONNECT"
-                            && p.value() == b"connect-udp" =>
+                        if m.value() == b"CONNECT" && p.value() == b"connect-udp" =>
                     {
-                        if let Some((ip, port)) =
-                            dest_addr_from_masque_uri(target.value())
-                        {
+                        if let Some((ip, port)) = dest_addr_from_masque_uri(target.value()) {
                             log::info!("Handling MASQUE proxying request"; "ip" => &ip, "port" => &port);
 
                             let proxy = UdpSocket::bind("[::]:0")
@@ -188,9 +174,7 @@ async fn handle_connection(
                                 .expect("Failed to set the socket's destination");
 
                             if reliable_masque {
-                                log::info!(
-                                    "Using the Capsule Protocol for this tunnel"
-                                );
+                                log::info!("Using the Capsule Protocol for this tunnel");
 
                                 indicate_successful_response(
                                     &mut send,
@@ -217,9 +201,7 @@ async fn handle_connection(
                                 if let (Some(dgram_send), Some(dgram_recv)) =
                                     (t.send.take(), t.recv.take())
                                 {
-                                    forward_dgrams(
-                                        proxy, dgram_send, dgram_recv, flow_id,
-                                    );
+                                    forward_dgrams(proxy, dgram_send, dgram_recv, flow_id);
                                 }
                             }
                         }
@@ -255,7 +237,7 @@ async fn handle_connection(
 
             ServerH3Event::Core(event) => {
                 log::debug!("event: {event:?}");
-            },
+            }
         }
     }
 }
@@ -268,10 +250,7 @@ async fn indicate_successful_response(
     send.send(OutboundFrame::Headers(
         vec![
             Header::new(b":status", b"200"),
-            Header::new(
-                b"capsule-protocol",
-                sfv_bool(reliable_masque).as_bytes(),
-            ),
+            Header::new(b"capsule-protocol", sfv_bool(reliable_masque).as_bytes()),
         ],
         priority,
     ))

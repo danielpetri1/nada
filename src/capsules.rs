@@ -2,8 +2,8 @@ use crate::helpers::sfv_bool;
 use crate::{CONTEXT_ID_VARINT_LEN, UDP_PAYLOAD_CONTEXT_ID};
 use foundations::telemetry::log;
 use octets::{varint_len, varint_parse_len, Octets, OctetsMut};
-use std::collections::VecDeque;
 use quiche::BufFactory as _;
+use std::collections::VecDeque;
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::OutboundFrame;
 
@@ -18,11 +18,10 @@ pub fn dgram_capsule_from_udp_payload(udp_payload: &[u8]) -> OutboundFrame {
     // HTTP Datagram Payload = Context ID + UDP payload
     let http_datagram_payload_len = CONTEXT_ID_VARINT_LEN + udp_payload.len();
     let payload_len_varint_size = varint_len(http_datagram_payload_len as u64);
-    
+
     // Capsule = Type (CAPSULE_TYPE_DATAGRAM) + Length + HTTP Datagram Payload
-    let capsule_capacity = DGRAM_CAPSULE_TYPE_LEN
-        + payload_len_varint_size
-        + http_datagram_payload_len;
+    let capsule_capacity =
+        DGRAM_CAPSULE_TYPE_LEN + payload_len_varint_size + http_datagram_payload_len;
     let mut capsule = vec![0u8; capsule_capacity];
     let mut o = OctetsMut::with_slice(&mut capsule);
 
@@ -41,7 +40,7 @@ pub fn dgram_capsule_from_udp_payload(udp_payload: &[u8]) -> OutboundFrame {
         .expect("failed to write UDP payload");
 
     let written = o.off();
-    
+
     OutboundFrame::Body(BufFactory::buf_from_slice(&capsule[..written]), false)
 }
 
@@ -121,8 +120,7 @@ impl CapsuleDeframer {
 
                     // Try to parse the varint
                     if let (Some(capsule_type), consumed) = Self::try_parse_varint(
-                        &new_data
-                            [data_index..data_index + DGRAM_CAPSULE_TYPE_LEN],
+                        &new_data[data_index..data_index + DGRAM_CAPSULE_TYPE_LEN],
                     ) {
                         if capsule_type == CAPSULE_TYPE_DATAGRAM {
                             log::trace!(
@@ -156,9 +154,7 @@ impl CapsuleDeframer {
 
                     // Store the bytes in case they are needed later.
                     partial_buf[prev_written..total_length_bytes]
-                        .copy_from_slice(
-                            &new_data[data_index..data_index + new_length_bytes],
-                        );
+                        .copy_from_slice(&new_data[data_index..data_index + new_length_bytes]);
 
                     // Try to parse the varint
                     if let (Some(l), consumed) =
@@ -166,11 +162,7 @@ impl CapsuleDeframer {
                     {
                         let length = l as usize;
 
-                        log::trace!(
-                            "Parsed capsule length: {} ({}B varint)",
-                            length,
-                            consumed
-                        );
+                        log::trace!("Parsed capsule length: {} ({}B varint)", length, consumed);
 
                         // Advance the data index by the real number of new bytes consumed
                         // The data index resets once new data arrives,
@@ -209,19 +201,14 @@ impl CapsuleDeframer {
                     let new_value_bytes = max_still_needed.min(unparsed);
 
                     // Store the bytes in case they are needed later.
-                    partial_buf
-                        [*partial_written..*partial_written + new_value_bytes]
-                        .copy_from_slice(
-                            &new_data[data_index..data_index + new_value_bytes],
-                        );
+                    partial_buf[*partial_written..*partial_written + new_value_bytes]
+                        .copy_from_slice(&new_data[data_index..data_index + new_value_bytes]);
 
                     let p_written = *partial_written + new_value_bytes;
 
                     // If we have the complete value, process it
                     if p_written == length {
-                        if let Some(udp_payload) =
-                            extract_udp_from_datagram_capsule(partial_buf)
-                        {
+                        if let Some(udp_payload) = extract_udp_from_datagram_capsule(partial_buf) {
                             // Advance by the new bytes consumed should more capsules follow
                             data_index += new_value_bytes;
                             self.udp_payloads.push_back(udp_payload);

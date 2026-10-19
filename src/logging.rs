@@ -18,6 +18,7 @@ pub fn init(verbosity: Option<LogVerbosity>) {
                     format: Default::default(),
                     verbosity,
                     redact_keys: Default::default(),
+                    ignore_io_errors: false,
                     rate_limit: Default::default(),
                     log_volume_metrics: Default::default(),
                 },

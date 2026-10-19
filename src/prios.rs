@@ -25,9 +25,7 @@ pub fn parse_raw_priority(raw_prio: Option<Vec<u8>>) -> Option<h3::Priority> {
             .unwrap_or(DEFAULT_URGENCY);
 
         incremental = match dict.get("i") {
-            Some(ListEntry::Item(item)) => {
-                item.bare_item.as_boolean().unwrap_or(false)
-            }
+            Some(ListEntry::Item(item)) => item.bare_item.as_boolean().unwrap_or(false),
             _ => false,
         };
     }
@@ -51,8 +49,7 @@ mod eps {
 
     #[test]
     fn returns_defaults_on_empty() {
-        let prio =
-            parse_raw_priority(Some(Vec::new())).expect("Default priority");
+        let prio = parse_raw_priority(Some(Vec::new())).expect("Default priority");
         assert_eq!(prio, h3::Priority::default());
     }
 
@@ -64,29 +61,25 @@ mod eps {
 
     #[test]
     fn parses_incremental_only() {
-        let prio = parse_raw_priority(bytes("i"))
-            .expect("Default prio with incremental flag set");
+        let prio = parse_raw_priority(bytes("i")).expect("Default prio with incremental flag set");
         assert_eq!(prio, h3::Priority::new(3, true));
     }
 
     #[test]
     fn parses_both_fields() {
-        let prio = parse_raw_priority(bytes("u=2, i"))
-            .expect("Parses both EPS parameters");
+        let prio = parse_raw_priority(bytes("u=2, i")).expect("Parses both EPS parameters");
         assert_eq!(prio, h3::Priority::new(2, true));
     }
 
     #[test]
     fn clamps_urgency_high() {
-        let prio =
-            parse_raw_priority(bytes("u=10, i")).expect("Clamps a low urgency");
+        let prio = parse_raw_priority(bytes("u=10, i")).expect("Clamps a low urgency");
         assert_eq!(prio, h3::Priority::new(7, true));
     }
 
     #[test]
     fn clamps_urgency_low() {
-        let prio =
-            parse_raw_priority(bytes("u=-5")).expect("Clamps a high urgency");
+        let prio = parse_raw_priority(bytes("u=-5")).expect("Clamps a high urgency");
         assert_eq!(prio, h3::Priority::new(0, false));
     }
 

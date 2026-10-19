@@ -100,14 +100,12 @@ pub fn write_connection_stats(
         "delivery_rate": path_stats.map(|p| p.delivery_rate),
     });
 
-    let stats_file_path =
-        format!("{}/outer-connection-stats-{:?}.json", results_dir, conn_id);
+    let stats_file_path = format!("{}/outer-connection-stats-{:?}.json", results_dir, conn_id);
     let json_string = serde_json::to_string_pretty(&json)
         .map_err(|e| format!("Failed to serialize stats: {}", e))?;
 
-    let mut file = File::create(&stats_file_path).map_err(|e| {
-        format!("Failed to create stats file {}: {}", stats_file_path, e)
-    })?;
+    let mut file = File::create(&stats_file_path)
+        .map_err(|e| format!("Failed to create stats file {}: {}", stats_file_path, e))?;
     file.write_all(json_string.as_bytes())
         .map_err(|e| format!("Failed to write stats to file: {}", e))?;
 
