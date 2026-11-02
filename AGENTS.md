@@ -1,8 +1,12 @@
 # UDP forwarding and library access
 
 - Keep documentation concise. Explain each behavior once in the most relevant
-  guide; link to it elsewhere when needed. Avoid repeated explanations and
+  guide. Link to it elsewhere when needed. Avoid repeated explanations and
   unnecessary detail.
+- Prefer separate sentences in documentation prose and code comments. Use
+  semicolons when they make sense and read naturally.
+- Make visual assets respect light and dark mode. Prefer theme-aware SVGs and
+  provide light and dark raster variants when needed.
 - Use Rust for application code and Bash for scripts and script tests.
 - Keep network testing manual with direct commands the user can follow. Do not
   add production test harnesses, test runners or demo orchestration scripts.
@@ -30,19 +34,20 @@
 - Keep the UDP forwarder, transport and proxy portable. Do not reintroduce
   transparent interception, raw sockets, privileged routing, nftables or
   namespace setup. The local forwarder runs as an ordinary user.
-- Network tests always use this Linux computer as the client and the running
-  production proxy/real origins. Do not add localhost network tests, local proxy
-  fixtures, or isolated proxy namespaces. Pure tests without network I/O may
-  remain; production checks are manual and must not run automatically in CI.
+- Network tests use the local computer (Linux or macOS) as the client and the
+  running production proxy/real origins. Do not add localhost network tests,
+  local proxy fixtures, or isolated proxy namespaces. Pure tests without network
+  I/O may remain. Production checks are manual and must not run automatically
+  in CI.
 - Copy `env-examples.sh` to the ignored `env.sh` for local configuration.
   `build.sh` sources `env.sh` when present, otherwise `env-examples.sh`.
   Source either file to load its values in the current Bash shell. CLI options
   override environment values, which override the built-in defaults.
 - Keep examples and tests consistent with dual-stack
   local listeners and the independent `[::1]:4431` outer default. Applications either
-  use the library or send to the listener with ordinary UDP sockets; no local
+  use the library or send to the listener with ordinary UDP sockets. No local
   control protocol is needed.
 - Use `TARGET_H3`, defaulting to `https://nghttp2.org:4433/`, for manual HTTP/3
   GET checks. Use port 4432 for illustrative origins and 4431 for illustrative
-  proxies. `DEFAULT_PORT` supplies the proxy port in environment defaults;
-  configure TLS paths through `PROXY_CERT` and `PROXY_KEY` in the environment files.
+  proxies. `DEFAULT_PORT` supplies the proxy port in environment defaults.
+  Configure TLS paths through `PROXY_CERT` and `PROXY_KEY` in the environment files.

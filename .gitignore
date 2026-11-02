@@ -8,3 +8,4 @@ results/
 !/certs/generate.sh
 /AGENTS.md
 *.mobileconfig
+/docs/assets/nada-social-preview*.png
