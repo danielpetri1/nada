@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux
+            os: ubuntu-latest
+          - platform: macOS
+            os: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check Bash syntax
+        run: |
+          for script in build.sh env-examples.sh certs/generate.sh; do
+            bash -n "$script"
+          done
+
+      - name: Install Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default stable
+          echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends cmake clang libclang-dev
+
+      - name: Cache Cargo dependencies and builds
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --locked --all-targets
+
+      - name: Release build
+        run: cargo build --release --locked
