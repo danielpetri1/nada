@@ -1,0 +1,13 @@
+# One concurrent GET per line: URL PRIORITY OUTPUT
+# Blank lines and lines starting with # are ignored.
+# ${TARGET_H3} defaults to https://nghttp2.org:4433/ when the variable is unset.
+# Control the substrate's reliability separately with --reliable.
+${TARGET_H3} u=0,i  results/index-u0-1.html
+${TARGET_H3} u=0,i  results/index-u0-2.html
+${TARGET_H3} u=0,i  results/index-u0-3.html
+${TARGET_H3} u=3,i  results/index-u3-1.html
+${TARGET_H3} u=3,i  results/index-u3-2.html
+${TARGET_H3} u=3,i  results/index-u3-3.html
+${TARGET_H3} u=5,i  results/index-u5-1.html
+${TARGET_H3} u=5,i  results/index-u5-2.html
+${TARGET_H3} u=5,i  results/index-u5-3.html

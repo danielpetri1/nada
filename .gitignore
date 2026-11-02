@@ -1,0 +1,10 @@
+**/target
+**/*.*qlog
+.idea/
+results/
+*.DS_Store
+/env.sh
+/certs/*
+!/certs/generate.sh
+/AGENTS.md
+*.mobileconfig
