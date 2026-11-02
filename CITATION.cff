@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "Please cite the paper below if you use Nada in your research."
+title: Nada
+authors:
+  - family-names: Petri
+    given-names: Daniel
+preferred-citation:
+  type: conference-paper
+  authors:
+    - family-names: Petri
+      given-names: Daniel
+    - family-names: Holzinger
+      given-names: Kilian
+    - family-names: Kempf
+      given-names: Marcel
+    - family-names: Gallenmüller
+      given-names: Sebastian
+    - family-names: Carle
+      given-names: Georg
+  title: "u and i: Cooperative Multipath MASQUE Scheduling with HTTP/3 Prioritization"
+  year: 2026
+  isbn: "9798400728761"
+  publisher:
+    name: Association for Computing Machinery
+    address: New York, NY, USA
+  url: https://doi.org/10.1145/3822163.3827938
+  doi: 10.1145/3822163.3827938
+  collection-title: Proceedings of the 2026 Applied Networking Research Workshop
+  start: 113
+  end: 118
+  pages: 6
+  keywords:
+    - QUIC
+    - HTTP/3
+    - MASQUE
+    - EPS scheduling
+  conference:
+    name: "ANRW '26"
+    location: Vienna, Austria
