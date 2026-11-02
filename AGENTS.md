@@ -2,7 +2,8 @@
 
 - Keep documentation concise. Explain each behavior once in the most relevant
   guide. Link to it elsewhere when needed. Avoid repeated explanations and
-  unnecessary detail.
+  unnecessary detail. Keep README updates limited to essential information
+  for users.
 - Prefer separate sentences in documentation prose and code comments. Use
   semicolons when they make sense and read naturally.
 - Make visual assets respect light and dark mode. Prefer theme-aware SVGs and
@@ -41,13 +42,14 @@
   in CI.
 - Copy `env-examples.sh` to the ignored `env.sh` for local configuration.
   `build.sh` sources `env.sh` when present, otherwise `env-examples.sh`.
-  Source either file to load its values in the current Bash shell. CLI options
-  override environment values, which override the built-in defaults.
+  Source either file to replace its configured environment values in the current
+  Bash shell. CLI options override environment values, which override the
+  built-in defaults.
 - Keep examples and tests consistent with dual-stack
   local listeners and the independent `[::1]:4431` outer default. Applications either
   use the library or send to the listener with ordinary UDP sockets. No local
   control protocol is needed.
 - Use `TARGET_H3`, defaulting to `https://nghttp2.org:4433/`, for manual HTTP/3
   GET checks. Use port 4432 for illustrative origins and 4431 for illustrative
-  proxies. `DEFAULT_PORT` supplies the proxy port in environment defaults.
+  proxies. `DEFAULT_PROXY_PORT` supplies the proxy port in environment files.
   Configure TLS paths through `PROXY_CERT` and `PROXY_KEY` in the environment files.
