@@ -1,20 +1,17 @@
 use crate::args::ConnectionArgs;
 use crate::helpers::connect_udp_path;
 use crate::tcp_tunnel::TcpTunnel;
+use crate::tls::configure_tls;
 use crate::tunnel::{
     Substrate, TunnelChannels, TunnelError, TunnelState, UdpTunnel, MAX_UDP_PAYLOAD,
 };
 use crate::{
-    write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS, SETTINGS_H3_DATAGRAM,
+    tls_curves_list, write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS,
+    SETTINGS_H3_DATAGRAM,
 };
 use boring::ssl::{SslContextBuilder, SslMethod};
 use foundations::telemetry::log;
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot, watch},
@@ -25,24 +22,13 @@ use tokio_quiche::http3::driver::{
     OutboundFrameSender, StreamShutdown,
 };
 use tokio_quiche::http3::settings::Http3Settings;
-use tokio_quiche::quic::{connect_with_config, ConnectionHook, QuicCommand};
+use tokio_quiche::quic::{connect_with_config, QuicCommand};
 use tokio_quiche::quiche::h3::{Header, NameValue, WireErrorCode};
-use tokio_quiche::settings::{CertificateKind, TlsCertificatePaths};
 use tokio_quiche::socket::Socket;
 use tokio_quiche::{ClientH3Controller, ClientH3Driver, ConnectionParams};
 
 /// Default CONNECT/CONNECT-UDP priority
 pub const DEFAULT_STREAM_PRIORITY: &str = "u=3,i";
-
-struct ProxyTrust(Mutex<Option<SslContextBuilder>>);
-impl ConnectionHook for ProxyTrust {
-    fn create_custom_ssl_context_builder(
-        &self,
-        _: TlsCertificatePaths<'_>,
-    ) -> Option<SslContextBuilder> {
-        self.0.lock().ok()?.take()
-    }
-}
 
 struct OpenRequest {
     target: SocketAddr,
@@ -136,24 +122,16 @@ impl MasqueClient {
                 params.settings.qlog_dir = Some(dir.clone());
             }
         }
-        let ca = args
-            .proxy_ca
-            .as_ref()
-            .map(|p| {
-                p.to_str()
-                    .ok_or_else(|| connection_error("CA path is not UTF-8"))
-            })
-            .transpose()?;
-        if let Some(ca) = ca {
-            let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(connection_error)?;
+        let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(connection_error)?;
+        if let Some(ca) = &args.proxy_ca {
             builder.set_ca_file(ca).map_err(connection_error)?;
-            params.hooks.connection_hook = Some(Arc::new(ProxyTrust(Mutex::new(Some(builder)))));
-            params.tls_cert = Some(TlsCertificatePaths {
-                cert: ca,
-                private_key: "",
-                kind: CertificateKind::X509,
-            });
+        } else {
+            builder
+                .set_default_verify_paths()
+                .map_err(connection_error)?;
         }
+        let curves = tls_curves_list().map_err(connection_error)?;
+        configure_tls(&mut params, builder, &curves).map_err(connection_error)?;
         let request_timeout = Duration::from_secs(args.connect_timeout);
         let connection = timeout(
             request_timeout,

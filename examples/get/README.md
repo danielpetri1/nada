@@ -34,8 +34,8 @@ Edit [scenarios.txt](scenarios.txt) to define concurrent GETs.
 
 ```text
 # URL PRIORITY OUTPUT
-${TARGET_H3} u=0,i results/high.html
-${TARGET_H3} u=7,i results/low.html
+https://nghttp2.org:4433/ u=0,i results/high.html
+https://nghttp2.org:4433/ u=7,i results/low.html
 ```
 
 Blank lines and those starting with `#` are ignored. Other scenario files can be chosen with:
@@ -48,8 +48,8 @@ Alternatively, repeat `--get URL PRIORITY OUTPUT` to replace the scenario file's
 
 ```sh
 cargo run --release --example get -- \
-  --get "$TARGET_H3" 'u=0,i' results/high.html \
-  --get "$TARGET_H3" 'u=7,i' results/low.html
+  --get https://nghttp2.org:4433/ 'u=0,i' results/high.html \
+  --get https://nghttp2.org:4433/ 'u=7,i' results/low.html
 ```
 
 `PRIORITY` uses HTTP Priority syntax: urgency `u=0` is highest and `u=7` lowest.

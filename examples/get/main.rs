@@ -1,17 +1,18 @@
 use clap::Parser;
 use futures::future::try_join_all;
-use nada::{args::ConnectionArgs, client::MasqueClient, logging, tunnel::DatagramSender};
+use nada::{
+    args::ConnectionArgs, client::MasqueClient, logging, tls_curves_list, tunnel::DatagramSender,
+};
+use quiche::{h3, h3::NameValue};
 use sfv::{Dictionary, FieldType, ListEntry};
 use std::{
     collections::HashSet, fs::File, io::Write, net::SocketAddr, path::PathBuf, time::Duration,
 };
 use tokio::time::{sleep_until, timeout};
-use tokio_quiche::quiche::{self, h3, h3::NameValue};
 use url::{Host, Position, Url};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 const INNER_PACKET_SIZE: usize = 1200;
-const DEFAULT_TARGET_H3: &str = "https://nghttp2.org:4433/";
 
 #[derive(Parser)]
 #[command(
@@ -29,10 +30,6 @@ struct Options {
     /// Scenario file (default: examples/get/scenarios.txt).
     #[arg(long, value_name = "FILE", conflicts_with = "gets")]
     scenarios: Option<PathBuf>,
-
-    /// HTTPS URL substituted for ${TARGET_H3} in the scenario file.
-    #[arg(long, env = "TARGET_H3", default_value = DEFAULT_TARGET_H3)]
-    target_h3: String,
 
     /// Overall deadline in seconds for each GET, including its tunnel and inner TLS handshake.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
@@ -132,18 +129,17 @@ fn requests(fields: &[String]) -> Result<Vec<Get>, Error> {
     validate_requests(gets)
 }
 
-fn scenario_requests(contents: &str, target_h3: &str) -> Result<Vec<Get>, Error> {
+fn scenario_requests(contents: &str) -> Result<Vec<Get>, Error> {
     let mut gets = Vec::new();
     for (index, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut fields: Vec<String> = line.split_whitespace().map(String::from).collect();
+        let fields: Vec<String> = line.split_whitespace().map(String::from).collect();
         if fields.len() != 3 {
             return Err(format!("line {}: each GET needs URL PRIORITY OUTPUT", index + 1).into());
         }
-        fields[0] = fields[0].replace("${TARGET_H3}", target_h3);
         gets.push(Get::parse(&fields).map_err(|error| format!("line {}: {error}", index + 1))?);
     }
     validate_requests(gets)
@@ -181,8 +177,7 @@ fn load_requests(options: &Options) -> Result<Vec<Get>, Error> {
     let path = options.scenarios.as_ref().unwrap_or(&default);
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read scenarios {}: {error}", path.display()))?;
-    scenario_requests(&contents, &options.target_h3)
-        .map_err(|error| format!("{}: {error}", path.display()).into())
+    scenario_requests(&contents).map_err(|error| format!("{}: {error}", path.display()).into())
 }
 
 #[tokio::main]
@@ -231,6 +226,7 @@ async fn fetch(client: &MasqueClient, get: &Get, options: &Options) -> Result<()
     }
     .parse()?;
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    config.set_curves_list(&tls_curves_list()?)?;
     config.set_cc_algorithm_name(&options.connection.common.cc_algorithm)?;
     config.enable_pacing(true);
     config.verify_peer(true);
@@ -415,6 +411,8 @@ async fn flush_packets(
 mod tests {
     use super::*;
 
+    const TARGET_H3: &str = "https://nghttp2.org:4433/";
+
     fn fields(priority: &str, url: &str, output: &str) -> Vec<String> {
         [url, priority, output].map(String::from).to_vec()
     }
@@ -487,12 +485,11 @@ mod tests {
     }
 
     #[test]
-    fn scenario_files_preserve_requests_and_expand_origin() {
+    fn scenario_files_preserve_request_urls_and_priorities() {
         let gets = scenario_requests(
             "# URL PRIORITY OUTPUT\n\n\
-             ${TARGET_H3} u=0,i  high.html\n\
+             https://origin.example.org:4432/?size=2 u=0,i  high.html\n\
              https://example.org/other.txt?size=2 u=7,i=?0  low.txt\n",
-            "https://origin.example.org:4432/?size=2",
         )
         .unwrap();
         assert_eq!(gets.len(), 2);
@@ -508,26 +505,25 @@ mod tests {
 
     #[test]
     fn scenario_files_reject_empty_invalid_duplicate_and_excessive_requests() {
-        assert!(scenario_requests("\n # no requests\n", DEFAULT_TARGET_H3).is_err());
+        assert!(scenario_requests("\n # no requests\n").is_err());
         for row in [
-            "${TARGET_H3} u=3,i",
-            "${TARGET_H3} u=8 out",
-            "bad-target u=3,i out",
-            "${TARGET_H3} u=3,i out extra",
-            "u=3,i ${TARGET_H3} out",
+            format!("{TARGET_H3} u=3,i"),
+            format!("{TARGET_H3} u=8 out"),
+            "bad-target u=3,i out".into(),
+            format!("{TARGET_H3} u=3,i out extra"),
+            format!("u=3,i {TARGET_H3} out"),
         ] {
-            let error =
-                scenario_requests(&format!("# comment\n\n{row}\n"), DEFAULT_TARGET_H3).unwrap_err();
+            let error = scenario_requests(&format!("# comment\n\n{row}\n")).unwrap_err();
             assert!(error.to_string().starts_with("line 3:"), "{error}");
         }
-        let row = "${TARGET_H3} u=3,i same.html\n";
-        let error = scenario_requests(&row.repeat(2), DEFAULT_TARGET_H3).unwrap_err();
+        let row = format!("{TARGET_H3} u=3,i same.html\n");
+        let error = scenario_requests(&row.repeat(2)).unwrap_err();
         assert!(error.to_string().contains("distinct output files"));
 
         let rows: String = (0..=nada::MAX_STREAMS)
-            .map(|n| format!("${{TARGET_H3}} u=3,i out{n}.html\n"))
+            .map(|n| format!("{TARGET_H3} u=3,i out{n}.html\n"))
             .collect();
-        let error = scenario_requests(&rows, DEFAULT_TARGET_H3).unwrap_err();
+        let error = scenario_requests(&rows).unwrap_err();
         assert!(error.to_string().contains("concurrent GETs"));
     }
 
@@ -540,7 +536,7 @@ mod tests {
             "--scenarios",
             "benchmark.txt",
             "--get",
-            DEFAULT_TARGET_H3,
+            TARGET_H3,
             "u=3,i",
             "out.html",
         ])
@@ -550,7 +546,7 @@ mod tests {
     #[test]
     fn rejects_invalid_scenarios_before_connecting() {
         for priority in ["u=8", "u=-1", "u=\"3\"", "i=5", "u=3,broken=="] {
-            assert!(Get::parse(&fields(priority, DEFAULT_TARGET_H3, "out")).is_err());
+            assert!(Get::parse(&fields(priority, TARGET_H3, "out")).is_err());
         }
         for url in [
             "https://0.0.0.0:443/",
@@ -568,24 +564,19 @@ mod tests {
         ] {
             assert!(Get::parse(&fields("u=3,i", url, "out")).is_err(), "{url}");
         }
-        let mut values = fields("u=0,i", DEFAULT_TARGET_H3, "same.html");
+        let mut values = fields("u=0,i", TARGET_H3, "same.html");
         values.extend(fields("u=7,i", "https://[2001:db8::1]:4432/", "same.html"));
         assert!(requests(&values).is_err());
         assert!(requests(&values[..2]).is_err());
     }
 
     #[test]
-    fn target_url_override_is_expanded_without_network_io() {
-        for target in [DEFAULT_TARGET_H3, "https://example.org:4432/file?size=2"] {
-            let options = Options::try_parse_from(["get", "--target-h3", target]).unwrap();
-            let gets =
-                scenario_requests("${TARGET_H3} u=3,i results/index.html", &options.target_h3)
-                    .unwrap();
-            assert_eq!(gets.len(), 1);
-            assert_eq!(
-                format!("https://{}{}", gets[0].authority, gets[0].path),
-                target
-            );
+    fn default_scenarios_use_the_public_http3_origin() {
+        let options = Options::try_parse_from(["get"]).unwrap();
+        let gets = load_requests(&options).unwrap();
+        assert_eq!(gets.len(), 9);
+        for get in gets {
+            assert_eq!(format!("https://{}{}", get.authority, get.path), TARGET_H3);
         }
     }
 }

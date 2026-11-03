@@ -8,6 +8,7 @@ pub mod prios;
 pub mod proxy;
 pub mod tcp_flow;
 pub mod tcp_tunnel;
+mod tls;
 pub mod tunnel;
 pub mod udp_flow;
 
@@ -20,7 +21,18 @@ use tokio_quiche::QuicConnection;
 pub const UDP_PAYLOAD_CONTEXT_ID: u64 = 0x00;
 pub const CONTEXT_ID_VARINT_LEN: usize = varint_len(UDP_PAYLOAD_CONTEXT_ID);
 pub const MAX_STREAMS: u64 = 1000;
+/// Default TLS key exchange groups in preference order.
+pub const DEFAULT_TLS_CURVES_LIST: &str = "X25519MLKEM768:X25519:P-256:P-384";
 pub(crate) const SETTINGS_H3_DATAGRAM: u64 = 0x33;
+
+/// Read TLS_CURVES_LIST, using the built-in group list only when it is unset.
+pub fn tls_curves_list() -> Result<String, std::env::VarError> {
+    match std::env::var("TLS_CURVES_LIST") {
+        Ok(curves) => Ok(curves),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_TLS_CURVES_LIST.into()),
+        Err(error) => Err(error),
+    }
+}
 
 /// Maximum outer QUIC packet size on the client-proxy segment.
 /// Ref: Kühlewind et al. (2021), Section 4.1.

@@ -7,6 +7,7 @@ Nada is a MASQUE network relay that tunnels TCP and UDP over HTTP/3.
 ## Technology stack
 
 [![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.1145/3822163.3827938)
+[![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.2313/NET-2026-05-1_10)
 
 Nada is a prototype implementation based on:
 
@@ -28,8 +29,8 @@ source ./env.sh
 bash build.sh
 ```
 
-`build.sh` reinstalls `nada` from this checkout after sourcing `env.sh`, or
-`env-examples.sh` if absent. The separate `source` above keeps runtime settings
+`build.sh` (re-)installs `nada` from this checkout after sourcing `env.sh` (or
+`env-examples.sh` if absent). The separate `source` above keeps runtime settings
 in your current shell.
 
 ## Run
@@ -38,7 +39,7 @@ Applications can connect to Nada's local TCP or UDP listeners at `[::1]:18018` o
 Using the CLI requires specifying a `--target` to which all flows are sent.
 
 ```sh
-# Inspect proxy options on the listening host:
+# List available proxy options:
 cargo run --release -- proxy --help
 
 # Open a CONNECT-UDP tunnel:
@@ -49,7 +50,28 @@ dig @127.0.0.1 -p 18018 example.com +notcp +ignore
 dig @::1 -p 18018 example.com +notcp +ignore
 ```
 
-## Library
+### Sending modes
+
+Nada uses unreliable transmission by default.
+Each endpoint selects its preferred substrate for all CONNECT-UDP tunnels. Both endpoints decode
+both incoming formats regardless of their outgoing mode.
+
+| Client       | Proxy        | Client → proxy    | Proxy → client    |
+|--------------|--------------|-------------------|-------------------|
+| default      | default      | QUIC DATAGRAM     | QUIC DATAGRAM     |
+| default      | `--reliable` | QUIC DATAGRAM     | DATAGRAM capsules |
+| `--reliable` | default      | DATAGRAM capsules | QUIC DATAGRAM     |
+| `--reliable` | `--reliable` | DATAGRAM capsules | DATAGRAM capsules |
+
+Reliability covers the client–proxy segment. CONNECT always carries
+HTTP/3 DATA frames reliably and is therefore not affected by `--reliable`.
+
+### Encryption
+
+TLS key exchange prefers hybrid post-quantum `X25519MLKEM768` with classical
+fallbacks by default. `TLS_CURVES_LIST` is configurable in `env.sh`.
+
+### Library
 
 Nada's Rust library can also be used to open tunnels directly with `connect_udp` or `connect_tcp`.
 
@@ -62,29 +84,14 @@ Run it from the repository root:
 cargo run --release --example get
 ```
 
-Add `-- --reliable` to send DATAGRAM capsules for all GETs. The default uses unreliable transmission.
-
 Scenarios can be specified in [scenarios.txt](examples/get/scenarios.txt), c.f. the [example guide](examples/get/README.md). 
 
 Library callers can use `connect_udp_with_priority(target, urgency, incremental)`
 to choose each tunnel's priority.
 
+## Tunnel prioritization
+
 CONNECT and CONNECT-UDP requests use HTTP Priority `u=3,i` by default.
-
-## Sending modes
-
-Each endpoint selects its own sending mode for all CONNECT-UDP tunnels. Both endpoints decode
-both incoming formats regardless of their outgoing mode. Since CONNECT always carries reliable
-bytes in HTTP/3 DATA frames, it is not affected by `--reliable`.
-
-| Client       | Proxy        | Client → proxy    | Proxy → client    |
-|--------------|--------------|-------------------|-------------------|
-| default      | default      | QUIC DATAGRAM     | QUIC DATAGRAM     |
-| default      | `--reliable` | QUIC DATAGRAM     | DATAGRAM capsules |
-| `--reliable` | default      | DATAGRAM capsules | QUIC DATAGRAM     |
-| `--reliable` | `--reliable` | DATAGRAM capsules | DATAGRAM capsules |
-
-Reliability covers the client–proxy segment.
 
 ## Experimental features
 

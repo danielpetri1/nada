@@ -4,10 +4,13 @@ use crate::dgrams::{decode_dgram, proxied_dgram};
 use crate::helpers::dest_addr_from_masque_uri;
 use crate::prios::parse_raw_priority;
 use crate::tcp_tunnel::TcpTunnel;
+use crate::tls::configure_tls;
 use crate::tunnel::{Substrate, TunnelChannels, TunnelState, MAX_UDP_PAYLOAD};
 use crate::{
-    write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS, SETTINGS_H3_DATAGRAM,
+    tls_curves_list, write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS,
+    SETTINGS_H3_DATAGRAM,
 };
+use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod};
 use foundations::telemetry::log;
 use futures::{SinkExt, StreamExt};
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
@@ -71,19 +74,21 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: ProxyArgs) -> ProxyRes
             settings.qlog_dir = Some(dir.clone());
         }
     }
-    let mut listeners = listen(
-        vec![socket],
-        ConnectionParams::new_server(
-            settings,
-            TlsCertificatePaths {
-                cert: &args.cert,
-                private_key: &args.key,
-                kind: CertificateKind::X509,
-            },
-            Default::default(),
-        ),
-        DefaultMetrics,
-    )?;
+    let mut params = ConnectionParams::new_server(
+        settings,
+        TlsCertificatePaths {
+            cert: &args.cert,
+            private_key: &args.key,
+            kind: CertificateKind::X509,
+        },
+        Default::default(),
+    );
+    let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+    builder.set_certificate_chain_file(&args.cert)?;
+    builder.set_private_key_file(&args.key, SslFiletype::PEM)?;
+    builder.check_private_key()?;
+    configure_tls(&mut params, builder, &tls_curves_list()?)?;
+    let mut listeners = listen(vec![socket], params, DefaultMetrics)?;
     log::info!("HTTP/3 proxy listening"; "address" => %address);
     let mut connections = JoinSet::new();
     let mut accepted_connections = 0_u64;
