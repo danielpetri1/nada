@@ -6,5 +6,4 @@ export PROXY_AUTHORITY="localhost"
 export PROXY_CONNECT_PORTS="53,80,443,4433"
 export PROXY_CERT="certs/proxy-cert.pem"
 export PROXY_KEY="certs/proxy-key.pem"
-# TLS key exchange groups in preference order. Use "X25519MLKEM768" alone to require PQC.
 export TLS_CURVES_LIST="X25519MLKEM768:X25519:P-256:P-384"
