@@ -86,10 +86,10 @@ cargo run --release --example get
 
 Scenarios can be specified in [scenarios.txt](examples/get/scenarios.txt), c.f. the [example guide](examples/get/README.md). 
 
+### Tunnel prioritization
+
 Library callers can use `connect_udp_with_priority(target, urgency, incremental)`
 to choose each tunnel's priority.
-
-## Tunnel prioritization
 
 CONNECT and CONNECT-UDP requests use HTTP Priority `u=3,i` by default.
 
