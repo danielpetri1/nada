@@ -1,7 +1,7 @@
 use clap::Parser;
 use nada::{
-    args::{Cli, Command, ConnectArgs, ConnectUdpArgs, ProxyArgs},
-    create_results_dir, logging, proxy,
+    args::{Cli, Command, ConnectArgs, ConnectUdpArgs, RelayArgs},
+    create_results_dir, logging, relay,
 };
 
 #[tokio::main]
@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match Cli::parse().command {
         Command::Connect(args) => connect_tcp(args).await,
         Command::ConnectUdp(args) => connect_udp(args).await,
-        Command::Proxy(args) => run_proxy(args).await,
+        Command::Relay(args) => run_relay(args).await,
     }
 }
 
@@ -66,7 +66,7 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<(), Box<dyn std::error::Err
     use tokio::net::UdpSocket;
     logging::init(args.connection.common.log_level.clone().into());
     create_results_dir(&args.connection.common.results_dir);
-    // Bind every listener before opening the shared proxy connection.
+    // Bind every listener before opening the shared relay connection.
     let mut sockets = Vec::new();
     for address in &args.listen {
         let socket = UdpSocket::bind(address).await.map_err(|error| {
@@ -97,11 +97,11 @@ async fn connect_udp(args: ConnectUdpArgs) -> Result<(), Box<dyn std::error::Err
     result
 }
 
-async fn run_proxy(args: ProxyArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_relay(args: RelayArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     logging::init(args.common.log_level.clone().into());
     create_results_dir(&args.common.results_dir);
     tokio::select! {
-        result = proxy::serve(args) => result,
+        result = relay::serve(args) => result,
         result = stopped() => { result?; Ok(()) },
     }
 }

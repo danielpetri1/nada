@@ -1,6 +1,6 @@
 //! UDP tunnels established by CONNECT-UDP requests.
 use crate::capsules::{dgram_capsule_from_udp_payload, CapsuleDeframer};
-use crate::dgrams::{decode_dgram, proxied_dgram};
+use crate::dgrams::{decode_dgram, relayed_dgram};
 use futures::SinkExt;
 use std::{fmt, net::SocketAddr, sync::Arc};
 use tokio::sync::{mpsc, watch};
@@ -13,7 +13,7 @@ use tokio_quiche::http3::driver::{
 pub const MAX_UDP_PAYLOAD: usize = 65_507;
 const RECEIVE_QUEUE: usize = 64;
 
-/// The local sending policy for HTTP Datagrams on the client-proxy connection.
+/// The local sending policy for HTTP Datagrams on the client-relay connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Substrate {
     /// Unreliable HTTP Datagrams carried in QUIC DATAGRAM frames.
@@ -46,7 +46,7 @@ impl fmt::Display for TunnelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => write!(f, "tunnel closed"),
-            Self::Connection(reason) => write!(f, "proxy connection failed: {reason}"),
+            Self::Connection(reason) => write!(f, "relay connection failed: {reason}"),
             Self::Rejected(status) => write!(f, "tunnel request rejected with HTTP {status}"),
             Self::Protocol(reason) => write!(f, "invalid tunnel data: {reason}"),
             Self::TooLarge { size, maximum } => {
@@ -58,7 +58,7 @@ impl fmt::Display for TunnelError {
 }
 impl std::error::Error for TunnelError {}
 
-/// Lifecycle shared by individual UDP tunnels and the outer client-proxy connection.
+/// Lifecycle shared by individual UDP tunnels and the outer client-relay connection.
 #[derive(Clone, Debug)]
 pub(crate) enum TunnelState {
     Open,
@@ -237,7 +237,7 @@ impl DatagramSender {
             });
         }
         let frame = match self.substrate {
-            Substrate::Datagram => proxied_dgram(self.quarter_stream_id, payload),
+            Substrate::Datagram => relayed_dgram(self.quarter_stream_id, payload),
             Substrate::Capsule => dgram_capsule_from_udp_payload(payload),
         };
         let mut sender = self.frames.clone();

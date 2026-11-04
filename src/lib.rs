@@ -5,7 +5,7 @@ pub mod dgrams;
 pub mod helpers;
 pub mod logging;
 pub mod prios;
-pub mod proxy;
+pub mod relay;
 pub mod tcp_flow;
 pub mod tcp_tunnel;
 mod tls;
@@ -34,7 +34,7 @@ pub fn tls_curves_list() -> Result<String, std::env::VarError> {
     }
 }
 
-/// Maximum outer QUIC packet size on the client-proxy segment.
+/// Maximum outer QUIC packet size on the client-relay segment.
 /// Ref: Kühlewind et al. (2021), Section 4.1.
 pub const MAX_OUTER_QUIC_PACKET_SIZE: usize = 1380;
 

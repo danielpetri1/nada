@@ -16,8 +16,8 @@ const INNER_PACKET_SIZE: usize = 1200;
 
 #[derive(Parser)]
 #[command(
-    about = "Fetch files using independent HTTP/3 connections over one Nada proxy connection",
-    after_help = "All GETs send QUIC DATAGRAMs by default. Pass --reliable to send DATAGRAM capsules for every GET on the client-proxy connection."
+    about = "Fetch files using independent HTTP/3 connections over one Nada relay connection",
+    after_help = "All GETs send QUIC DATAGRAMs by default. Pass --reliable to send DATAGRAM capsules for every GET on the client-relay connection."
 )]
 struct Options {
     #[command(flatten)]
@@ -480,8 +480,8 @@ mod tests {
         assert_eq!(gets[1].server_name, "example.org");
         assert_eq!(gets[1].path, "/other.txt?size=2");
         assert_eq!(gets[1].output, PathBuf::from("low.txt"));
-        // Target families never select the outer proxy's address family.
-        assert!(options.connection.proxy_address.is_ipv6());
+        // Target families never select the outer relay's address family.
+        assert!(options.connection.relay_address.is_ipv6());
     }
 
     #[test]

@@ -2,31 +2,31 @@
 
 This example uses the `MasqueClient` to establish independent HTTP/3 connections, each of which GETs the
 [HTTP/3-only ngtcp2 interop server](https://github.com/ngtcp2/ngtcp2/wiki/ngtcp2-public-server-for-IETF-quicwg-interop). Every GET uses a QUIC DATAGRAM substrate by default. Add `--reliable` to send
-DATAGRAM capsules for all GETs on the shared outer client-proxy connection. The proxy's mode is configured separately.
-Inner and outer client connections and the proxy default to BBRv2 (`bbr2_gcongestion`).
+DATAGRAM capsules for all GETs on the shared outer client-relay connection. The relay's mode is configured separately.
+Inner and outer client connections and the relay default to BBRv2 (`bbr2_gcongestion`).
 
 ## Local testing
 
-Run the proxy and GET example on the same host, in separate terminals from the repository root.
-In the first terminal, load the environment, generate the certificate, and start the proxy:
+Run the relay and GET example on the same host, in separate terminals from the repository root.
+In the first terminal, load the environment, generate the certificate, and start the relay:
 
 ```sh
 source ./env.sh
 bash certs/generate.sh
-cargo run --release -- proxy
+cargo run --release -- relay
 ```
 
-The certificate uses `PROXY_AUTHORITY`, defaulting to `localhost`. The default`PROXY_CERT` and `PROXY_KEY` paths point
+The certificate uses `RELAY_AUTHORITY`, defaulting to `localhost`. The default`RELAY_CERT` and `RELAY_KEY` paths point
 to the generated files.
 
 In the second terminal, run the GET example explicitly trusting that certificate for the outer connection:
 
 ```sh
 source ./env.sh
-cargo run --release --example get -- --proxy-ca certs/proxy-cert.pem
+cargo run --release --example get -- --relay-ca certs/relay-cert.pem
 ```
 
-Without `--proxy-ca`, the client uses system trust roots.
+Without `--relay-ca`, the client uses system trust roots.
 
 ## Scenarios
 

@@ -6,7 +6,7 @@ use tokio_quiche::quiche::BufFactory as _;
 
 /// Encodes a UDP payload as an HTTP Datagram with Context ID 0 (RFC 9298, Section 5).
 /// tokio-quiche prepends the Quarter Stream ID (RFC 9297, Section 2.1).
-pub fn proxied_dgram(quarter_stream_id: u64, udp_payload: &[u8]) -> OutboundFrame {
+pub fn relayed_dgram(quarter_stream_id: u64, udp_payload: &[u8]) -> OutboundFrame {
     let mut dgram = vec![0u8; udp_payload.len() + CONTEXT_ID_VARINT_LEN];
     let mut octets = OctetsMut::with_slice(&mut dgram);
 

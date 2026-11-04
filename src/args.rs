@@ -5,7 +5,7 @@ use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-const DEFAULT_PROXY_ADDRESS: &str = "[::1]:4431";
+const DEFAULT_RELAY_ADDRESS: &str = "[::1]:4431";
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -46,45 +46,45 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Forward local TCP connections to a fixed target on one shared proxy connection.
+    /// Forward local TCP connections to a fixed target on one shared relay connection.
     Connect(ConnectArgs),
-    /// Forward local UDP traffic to a fixed target on one shared proxy connection.
+    /// Forward local UDP traffic to a fixed target on one shared relay connection.
     ConnectUdp(ConnectUdpArgs),
-    /// Run a proxy that accepts CONNECT and CONNECT-UDP requests over HTTP/3.
-    Proxy(ProxyArgs),
+    /// Run a relay that accepts CONNECT and CONNECT-UDP requests over HTTP/3.
+    Relay(RelayArgs),
 }
 
-/// Settings for the client-proxy HTTP/3 connection over outer QUIC.
+/// Settings for the client-relay HTTP/3 connection over outer QUIC.
 #[derive(clap::Args, Debug, Clone)]
 pub struct ConnectionArgs {
     #[command(flatten)]
     pub common: Args,
 
-    /// Remote proxy IP and port (IPv4:port or [IPv6]:port).
-    #[arg(long, env = "PROXY_ADDRESS", default_value = DEFAULT_PROXY_ADDRESS)]
-    pub proxy_address: SocketAddr,
+    /// Remote relay IP and port (IPv4:port or [IPv6]:port).
+    #[arg(long, env = "RELAY_ADDRESS", default_value = DEFAULT_RELAY_ADDRESS)]
+    pub relay_address: SocketAddr,
 
-    /// Local address for the connection to the proxy (default: wildcard in the proxy's IP family).
+    /// Local address for the connection to the relay (default: wildcard in the relay's IP family).
     #[arg(long)]
     pub client_address: Option<SocketAddr>,
 
-    /// Proxy TLS server name and HTTP authority.
-    #[arg(long, env = "PROXY_AUTHORITY", default_value = "localhost")]
-    pub proxy_authority: String,
+    /// Relay TLS server name and HTTP authority.
+    #[arg(long, env = "RELAY_AUTHORITY", default_value = "localhost")]
+    pub relay_authority: String,
 
-    /// PEM CA bundle for verifying the proxy (default: system trust roots).
+    /// PEM CA bundle for verifying the relay (default: system trust roots).
     #[arg(long)]
-    pub proxy_ca: Option<PathBuf>,
+    pub relay_ca: Option<PathBuf>,
 
     /// Maximum idle time for the outer QUIC connection; 0 disables its idle timeout.
     #[arg(long = "idle-timeout", default_value_t = 0)]
     pub idle_timeout_secs: u64,
 
-    /// Time allowed for the proxy connection handshake and each tunnel request.
+    /// Time allowed for the relay connection handshake and each tunnel request.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub connect_timeout: u64,
 
-    /// Send client-proxy UDP payloads in reliable DATAGRAM capsules; no effect on TCP.
+    /// Send client-relay UDP payloads in reliable DATAGRAM capsules; no effect on TCP.
     #[arg(long)]
     pub reliable: bool,
 
@@ -98,7 +98,7 @@ pub struct ConnectArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
 
-    /// Remote TCP destination as reached from the proxy (IPv4:port or [IPv6]:port).
+    /// Remote TCP destination as reached from the relay (IPv4:port or [IPv6]:port).
     #[arg(long, value_name = "ADDRESS", value_parser = parse_target)]
     pub target: SocketAddr,
 
@@ -120,7 +120,7 @@ pub struct ConnectUdpArgs {
     #[command(flatten)]
     pub connection: ConnectionArgs,
 
-    /// Remote UDP destination as reached from the proxy (IPv4:port or [IPv6]:port).
+    /// Remote UDP destination as reached from the relay (IPv4:port or [IPv6]:port).
     #[arg(long, value_name = "ADDRESS", value_parser = parse_target)]
     pub target: SocketAddr,
 
@@ -138,23 +138,23 @@ pub struct ConnectUdpArgs {
 }
 
 #[derive(clap::Args, Debug, Clone)]
-pub struct ProxyArgs {
+pub struct RelayArgs {
     #[clap(flatten)]
     pub common: Args,
 
     /// Local UDP address and port on which to accept QUIC connections.
-    #[arg(long, env = "PROXY_ADDRESS", value_name = "ADDRESS", default_value = DEFAULT_PROXY_ADDRESS)]
+    #[arg(long, env = "RELAY_ADDRESS", value_name = "ADDRESS", default_value = DEFAULT_RELAY_ADDRESS)]
     pub listen: SocketAddr,
 
     /// Path to the TLS certificate.
-    #[arg(long, env = "PROXY_CERT")]
+    #[arg(long, env = "RELAY_CERT")]
     pub cert: String,
 
     /// Path to the private TLS key.
-    #[arg(long, env = "PROXY_KEY")]
+    #[arg(long, env = "RELAY_KEY")]
     pub key: String,
 
-    /// Send all proxy-to-client UDP payloads in reliable DATAGRAM capsules.
+    /// Send all relay-to-client UDP payloads in reliable DATAGRAM capsules.
     #[arg(long)]
     pub reliable: bool,
 
@@ -163,7 +163,7 @@ pub struct ProxyArgs {
     pub connect_timeout: u64,
 
     /// Allowed destination ports, or "all"; explicit values replace the environment/default list.
-    #[arg(long = "connect-port", env = "PROXY_CONNECT_PORTS", value_name = "PORT|all", value_delimiter = ',', default_values = ["53", "80", "443", "4433"])]
+    #[arg(long = "connect-port", env = "RELAY_CONNECT_PORTS", value_name = "PORT|all", value_delimiter = ',', default_values = ["53", "80", "443", "4433"])]
     pub connect_ports: Vec<ConnectPort>,
 
     /// Logs statistics for each outer connection to the results directory.
@@ -214,10 +214,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_ports_are_explicit_and_replace_defaults() {
-        let Command::Proxy(default) = Cli::try_parse_from([
+    fn relay_ports_are_explicit_and_replace_defaults() {
+        let Command::Relay(default) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -232,9 +232,9 @@ mod tests {
             default.connect_ports,
             [53, 80, 443, 4433].map(|port| ConnectPort::Port(NonZeroU16::new(port).unwrap()))
         );
-        let Command::Proxy(custom) = Cli::try_parse_from([
+        let Command::Relay(custom) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -253,9 +253,9 @@ mod tests {
             custom.connect_ports,
             [53, 8443].map(|port| ConnectPort::Port(NonZeroU16::new(port).unwrap()))
         );
-        let Command::Proxy(comma_separated) = Cli::try_parse_from([
+        let Command::Relay(comma_separated) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -281,7 +281,7 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from([
                 "nada",
-                "proxy",
+                "relay",
                 "--cert",
                 "unused-cert",
                 "--key",
@@ -294,10 +294,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_all_ports_and_explicit_overrides() {
-        let Command::Proxy(all) = Cli::try_parse_from([
+    fn relay_all_ports_and_explicit_overrides() {
+        let Command::Relay(all) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -316,9 +316,9 @@ mod tests {
         }
         assert!(!ConnectPort::All.allows(0));
 
-        let Command::Proxy(restricted) = Cli::try_parse_from([
+        let Command::Relay(restricted) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -358,7 +358,7 @@ mod tests {
                 ]
             );
             assert_eq!(args.target, target.parse().unwrap());
-            assert!(args.connection.proxy_address.is_ipv6());
+            assert!(args.connection.relay_address.is_ipv6());
             let Command::Connect(args) = Cli::try_parse_from([
                 "nada",
                 "connect",
@@ -397,17 +397,17 @@ mod tests {
     }
 
     #[test]
-    fn listener_target_and_proxy_families_are_independent() {
+    fn listener_target_and_relay_families_are_independent() {
         assert!(Cli::try_parse_from(["nada", "connect-udp"]).is_err());
         for target in ["1.1.1.1:53", "[2606:4700:4700::1111]:53"] {
-            for proxy in [DEFAULT_PROXY_ADDRESS, "192.0.2.1:4431"] {
+            for relay in [DEFAULT_RELAY_ADDRESS, "192.0.2.1:4431"] {
                 let Command::ConnectUdp(args) = Cli::try_parse_from([
                     "nada",
                     "connect-udp",
                     "--target",
                     target,
-                    "--proxy-address",
-                    proxy,
+                    "--relay-address",
+                    relay,
                 ])
                 .unwrap()
                 .command
@@ -416,8 +416,8 @@ mod tests {
                 };
                 assert_eq!(args.target, target.parse::<SocketAddr>().unwrap());
                 assert_eq!(
-                    args.connection.proxy_address,
-                    proxy.parse::<SocketAddr>().unwrap()
+                    args.connection.relay_address,
+                    relay.parse::<SocketAddr>().unwrap()
                 );
                 assert_eq!(
                     args.listen,
@@ -450,8 +450,8 @@ mod tests {
             };
             assert_eq!(args.listen, vec![address.parse::<SocketAddr>().unwrap()]);
             assert_eq!(
-                args.connection.proxy_address,
-                DEFAULT_PROXY_ADDRESS.parse::<SocketAddr>().unwrap()
+                args.connection.relay_address,
+                DEFAULT_RELAY_ADDRESS.parse::<SocketAddr>().unwrap()
             );
         }
 
@@ -464,7 +464,7 @@ mod tests {
             "127.0.0.1:18018",
             "--listen",
             "[::1]:18018",
-            "--proxy-address",
+            "--relay-address",
             "127.0.0.1:4431",
             "--reliable",
         ])
@@ -481,9 +481,9 @@ mod tests {
             ]
         );
         assert!(args.connection.reliable);
-        let Command::Proxy(args) = Cli::try_parse_from([
+        let Command::Relay(args) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
@@ -498,7 +498,7 @@ mod tests {
         assert!(args.reliable);
         assert_eq!(
             args.listen,
-            DEFAULT_PROXY_ADDRESS.parse::<SocketAddr>().unwrap()
+            DEFAULT_RELAY_ADDRESS.parse::<SocketAddr>().unwrap()
         );
     }
 

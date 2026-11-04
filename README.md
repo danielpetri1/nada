@@ -40,13 +40,13 @@ Applications can connect to Nada's local TCP or UDP listeners at `[::1]:18018` o
 Using the CLI requires specifying a `--target` to which all flows are sent.
 
 ```sh
-# List available proxy options:
-cargo run --release -- proxy --help
+# List available relay options:
+cargo run --release -- relay --help
 
 # Open a CONNECT-UDP tunnel:
 cargo run --release -- connect-udp --target 1.1.1.1:53
 
-# Tunnel a DNS query through the proxy:
+# Tunnel a DNS query through the relay:
 dig @127.0.0.1 -p 18018 example.com +notcp +ignore
 dig @::1 -p 18018 example.com +notcp +ignore
 ```
@@ -55,7 +55,7 @@ dig @::1 -p 18018 example.com +notcp +ignore
 
 Nada's Rust library can also be used to open tunnels directly with `connect_udp` or `connect_tcp`.
 
-The [HTTP/3 GET example](examples/get/main.rs) opens a single client-proxy connection and opens concurrent tunnels with potentially
+The [HTTP/3 GET example](examples/get/main.rs) opens a single client-relay connection and opens concurrent tunnels with potentially
 varying origins, paths, and priorities. Each tunnel carries an independent end-to-end HTTP/3 connection.
 
 Run it from the repository root:
@@ -72,14 +72,14 @@ Nada uses unreliable transmission by default.
 Each endpoint selects its preferred substrate for all CONNECT-UDP tunnels. Both endpoints decode
 both incoming formats regardless of their outgoing mode.
 
-| Client       | Proxy        | Client → proxy    | Proxy → client    |
+| Client       | Relay        | Client → relay    | Relay → client    |
 |--------------|--------------|-------------------|-------------------|
 | default      | default      | QUIC DATAGRAM     | QUIC DATAGRAM     |
 | default      | `--reliable` | QUIC DATAGRAM     | DATAGRAM capsules |
 | `--reliable` | default      | DATAGRAM capsules | QUIC DATAGRAM     |
 | `--reliable` | `--reliable` | DATAGRAM capsules | DATAGRAM capsules |
 
-Reliability covers the client–proxy segment. CONNECT always carries
+Reliability covers the client–relay segment. CONNECT always carries
 HTTP/3 DATA frames reliably and is therefore not affected by `--reliable`.
 
 ### Encryption

@@ -49,7 +49,7 @@ enum OpenedTunnel {
 }
 
 impl OpenRequest {
-    fn headers(&self, proxy_authority: &str) -> Vec<Header> {
+    fn headers(&self, relay_authority: &str) -> Vec<Header> {
         let mut headers = vec![Header::new(b":method", b"CONNECT")];
         match self.kind {
             TunnelKind::Tcp => headers.push(Header::new(
@@ -58,7 +58,7 @@ impl OpenRequest {
             )),
             TunnelKind::Udp => headers.extend([
                 Header::new(b":protocol", b"connect-udp"),
-                Header::new(b":authority", proxy_authority.as_bytes()),
+                Header::new(b":authority", relay_authority.as_bytes()),
                 Header::new(b":scheme", b"https"),
                 Header::new(b":path", connect_udp_path(self.target).as_bytes()),
                 Header::new(b"capsule-protocol", b"?1"),
@@ -69,7 +69,7 @@ impl OpenRequest {
     }
 }
 
-/// One outer HTTP/3 connection to a proxy. TCP CONNECT and CONNECT-UDP tunnels
+/// One outer HTTP/3 connection to a relay. TCP CONNECT and CONNECT-UDP tunnels
 /// may coexist. Each request uses its own independent HTTP/3 stream.
 #[derive(Clone)]
 pub struct MasqueClient {
@@ -82,11 +82,11 @@ pub struct MasqueClient {
 }
 
 impl MasqueClient {
-    /// Establish the outer QUIC connection and its HTTP/3 session with the proxy.
+    /// Establish the outer QUIC connection and its HTTP/3 session with the relay.
     pub async fn connect(args: &ConnectionArgs) -> Result<Self, TunnelError> {
-        let proxy = args.proxy_address;
+        let relay = args.relay_address;
         let local = args.client_address.unwrap_or_else(|| {
-            if proxy.is_ipv4() {
+            if relay.is_ipv4() {
                 "0.0.0.0:0"
             } else {
                 "[::]:0"
@@ -94,13 +94,13 @@ impl MasqueClient {
             .parse()
             .unwrap()
         });
-        if local.is_ipv4() != proxy.is_ipv4() {
+        if local.is_ipv4() != relay.is_ipv4() {
             return Err(TunnelError::Connection(
-                "client and proxy addresses must use the same IP family".into(),
+                "client and relay addresses must use the same IP family".into(),
             ));
         }
         let udp = UdpSocket::bind(local).await.map_err(connection_error)?;
-        udp.connect(proxy).await.map_err(connection_error)?;
+        udp.connect(relay).await.map_err(connection_error)?;
         let socket = Socket::<UdpSocket, UdpSocket>::from_udp(udp).map_err(connection_error)?;
         let (driver, controller) = ClientH3Driver::new(Http3Settings::default());
         let mut params = ConnectionParams::default();
@@ -123,7 +123,7 @@ impl MasqueClient {
             }
         }
         let mut builder = SslContextBuilder::new(SslMethod::tls()).map_err(connection_error)?;
-        if let Some(ca) = &args.proxy_ca {
+        if let Some(ca) = &args.relay_ca {
             builder.set_ca_file(ca).map_err(connection_error)?;
         } else {
             builder
@@ -135,7 +135,7 @@ impl MasqueClient {
         let request_timeout = Duration::from_secs(args.connect_timeout);
         let connection = timeout(
             request_timeout,
-            connect_with_config(socket, Some(&args.proxy_authority), &params, driver),
+            connect_with_config(socket, Some(&args.relay_authority), &params, driver),
         )
         .await
         .map_err(|_| TunnelError::Timeout)?
@@ -143,12 +143,12 @@ impl MasqueClient {
         let (requests, receiver) = mpsc::channel(64);
         let (state, status) = watch::channel(TunnelState::Open);
         let (shutdown, stop) = watch::channel(false);
-        let authority = args.proxy_authority.clone();
+        let authority = args.relay_authority.clone();
         let log_stats = args.log_stats;
         let results_dir = args.common.results_dir.clone();
         let connection_id: Arc<str> = format!("{:?}", connection.scid()).into();
         let substrate = Substrate::from_reliable(args.reliable);
-        log::info!("Outer proxy connection established"; "connection_id" => %connection_id, "sending_mode" => ?substrate);
+        log::info!("Outer relay connection established"; "connection_id" => %connection_id, "sending_mode" => ?substrate);
         tokio::spawn(async move {
             let result = run_connection(controller, receiver, authority, stop, substrate).await;
             if log_stats {
@@ -260,7 +260,7 @@ impl MasqueClient {
         .map_err(|_| TunnelError::Timeout)?
     }
 
-    /// Resolves when the shared proxy connection stops. Can be cancelled.
+    /// Resolves when the shared relay connection stops. Can be cancelled.
     pub async fn closed(&self) -> TunnelError {
         let mut state = self.state.clone();
         while matches!(*state.borrow(), TunnelState::Open) {
@@ -553,14 +553,14 @@ mod tests {
     #[test]
     fn connect_uses_target_authority_and_no_extended_connect_fields() {
         for target in ["1.1.1.1:53", "[2606:4700:4700::1111]:53"] {
-            let tcp = request(TunnelKind::Tcp, target).headers("proxy.example");
+            let tcp = request(TunnelKind::Tcp, target).headers("relay.example");
             assert_eq!(tcp.len(), 3);
             assert_eq!(tcp[0], Header::new(b":method", b"CONNECT"));
             assert_eq!(tcp[1], Header::new(b":authority", target.as_bytes()));
             assert_eq!(tcp[2], Header::new(b"priority", b"u=3,i"));
-            let udp = request(TunnelKind::Udp, target).headers("proxy.example");
+            let udp = request(TunnelKind::Udp, target).headers("relay.example");
             assert!(udp.contains(&Header::new(b":protocol", b"connect-udp")));
-            assert!(udp.contains(&Header::new(b":authority", b"proxy.example")));
+            assert!(udp.contains(&Header::new(b":authority", b"relay.example")));
             assert!(udp.contains(&Header::new(
                 b":path",
                 connect_udp_path(target.parse().unwrap()).as_bytes()

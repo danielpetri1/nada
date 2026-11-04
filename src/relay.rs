@@ -1,6 +1,6 @@
-use crate::args::{ConnectPort, ProxyArgs};
+use crate::args::{ConnectPort, RelayArgs};
 use crate::capsules::{dgram_capsule_from_udp_payload, CapsuleDeframer};
-use crate::dgrams::{decode_dgram, proxied_dgram};
+use crate::dgrams::{decode_dgram, relayed_dgram};
 use crate::helpers::dest_addr_from_masque_uri;
 use crate::prios::parse_raw_priority;
 use crate::tcp_tunnel::TcpTunnel;
@@ -31,7 +31,7 @@ use tokio_quiche::quiche::h3::{Header, NameValue, WireErrorCode};
 use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths};
 use tokio_quiche::{listen, ConnectionParams, ServerH3Controller, ServerH3Driver};
 
-type ProxyResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type RelayResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 struct TcpTarget {
     socket: TcpStream,
@@ -50,12 +50,12 @@ impl Drop for TcpTarget {
     }
 }
 
-pub async fn serve(args: ProxyArgs) -> ProxyResult {
+pub async fn serve(args: RelayArgs) -> RelayResult {
     let socket = UdpSocket::bind(args.listen).await?;
     serve_socket(socket, args).await
 }
 
-pub(crate) async fn serve_socket(socket: UdpSocket, args: ProxyArgs) -> ProxyResult {
+pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayResult {
     let address = socket.local_addr()?;
     let mut settings = QuicSettings::default();
     settings.enable_dgram = true;
@@ -68,7 +68,7 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: ProxyArgs) -> ProxyRes
     settings.max_recv_udp_payload_size = MAX_OUTER_QUIC_PACKET_SIZE;
     if let Some(dir) = &args.common.results_dir {
         if args.common.log_keys {
-            settings.keylog_file = Some(format!("{dir}/ssl-proxy.key"));
+            settings.keylog_file = Some(format!("{dir}/ssl-relay.key"));
         }
         if args.common.qlog {
             settings.qlog_dir = Some(dir.clone());
@@ -89,7 +89,7 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: ProxyArgs) -> ProxyRes
     builder.check_private_key()?;
     configure_tls(&mut params, builder, &tls_curves_list()?)?;
     let mut listeners = listen(vec![socket], params, DefaultMetrics)?;
-    log::info!("HTTP/3 proxy listening"; "address" => %address);
+    log::info!("HTTP/3 relay listening"; "address" => %address);
     let mut connections = JoinSet::new();
     let mut accepted_connections = 0_u64;
     loop {
@@ -241,7 +241,7 @@ async fn handle_connection(
                         let commands = controller.h3_cmd_sender();
                         let tunnel_connection_id = connection_id.clone();
                         let handle = tasks.spawn(async move {
-                            if let Err(err) = proxy_tunnel(target_socket, channels, stream_id / 4, substrate, maximum, &tunnel_connection_id).await {
+                            if let Err(err) = relay_tunnel(target_socket, channels, stream_id / 4, substrate, maximum, &tunnel_connection_id).await {
                                 log::warn!("UDP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum, "error" => %err);
                             }
                             let _ = commands.send(H3Command::ShutdownStream { stream_id, shutdown: StreamShutdown::Both { read_error_code: 0, write_error_code: 0 } });
@@ -335,14 +335,14 @@ async fn open_target_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
     Ok(socket)
 }
 
-async fn proxy_tunnel(
+async fn relay_tunnel(
     socket: UdpSocket,
     mut channels: TunnelChannels,
     quarter_stream_id: u64,
     substrate: Substrate,
     maximum: usize,
     connection_id: &str,
-) -> ProxyResult {
+) -> RelayResult {
     let target = socket.peer_addr()?;
     let mut buffer = vec![0; 65_536];
     let mut deframer = CapsuleDeframer::new();
@@ -355,7 +355,7 @@ async fn proxy_tunnel(
                     continue;
                 }
                 let frame = match substrate {
-                    Substrate::Datagram => proxied_dgram(quarter_stream_id, &buffer[..len]),
+                    Substrate::Datagram => relayed_dgram(quarter_stream_id, &buffer[..len]),
                     Substrate::Capsule => dgram_capsule_from_udp_payload(&buffer[..len]),
                 };
                 channels.send.send(frame).await?;
@@ -401,9 +401,9 @@ mod tests {
         };
         use clap::Parser;
 
-        let Command::Proxy(default) = Cli::try_parse_from([
+        let Command::Relay(default) = Cli::try_parse_from([
             "nada",
-            "proxy",
+            "relay",
             "--cert",
             "unused-cert",
             "--key",
