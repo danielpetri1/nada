@@ -10,7 +10,7 @@ Nada is a MASQUE network relay that tunnels TCP and UDP over HTTP/3.
 [![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.2313/NET-2026-05-1_10)
 
 Nada is compatible with Apple's [NERelay API](https://developer.apple.com/documentation/networkextension/nerelaymanager).
-The prototype implementation is based on:
+The implementation is based on:
 
 - [CONNECT-UDP](https://datatracker.ietf.org/doc/rfc9298/) (RFC 9298)
 - [CONNECT](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.4) (RFC 9114)
@@ -18,7 +18,8 @@ The prototype implementation is based on:
 - [HTTP/3 Extended CONNECT](https://www.rfc-editor.org/rfc/rfc9220.html#section-3) (RFC 9220)
 - [HTTP Datagrams and the Capsule Protocol](https://datatracker.ietf.org/doc/rfc9297/) (RFC 9297)
 
-Please cite the paper in [CITATION.cff](CITATION.cff) if you use Nada in your research.
+As a prototype under construction, Nada is **not** intended for production.
+Please cite [CITATION.cff](CITATION.cff) if you use Nada in your research.
 
 ## Setup
 
@@ -26,25 +27,32 @@ Please cite the paper in [CITATION.cff](CITATION.cff) if you use Nada in your re
 cp env-examples.sh env.sh
 
 # Edit env.sh to match your deployment
+vim env.sh
+
+# Keep runtime settings in the current shell
 source ./env.sh
+
+# Install nada
 bash build.sh
 ```
-
-`build.sh` (re-)installs `nada` from this checkout after sourcing `env.sh` (or
-`env-examples.sh` if absent). The separate `source` above keeps runtime settings
-in your current shell.
 
 ## Run
 
 Applications can connect to Nada's local TCP or UDP listeners at `[::1]:18018` or `127.0.0.1:18018`.
-Using the CLI requires specifying a `--target` to which all flows are sent.
+Using the CLI for local testing requires specifying a `--target` to which all flows are sent.
 
 ```sh
-# List available relay options:
-cargo run --release -- relay --help
+# See available options
+nada --help
+
+# Start the relay
+nada relay
 
 # Open a CONNECT-UDP tunnel:
-cargo run --release -- connect-udp --target 1.1.1.1:53
+nada connect-udp --target 1.1.1.1:53
+
+# Open a CONNECT tunnel:
+nada connect --target 1.1.1.1:53
 
 # Tunnel a DNS query through the relay:
 dig @127.0.0.1 -p 18018 example.com +notcp +ignore
@@ -55,8 +63,8 @@ dig @::1 -p 18018 example.com +notcp +ignore
 
 Nada's Rust library can also be used to open tunnels directly with `connect_udp` or `connect_tcp`.
 
-The [HTTP/3 GET example](examples/get/main.rs) opens a single client-relay connection and opens concurrent tunnels with potentially
-varying origins, paths, and priorities. Each tunnel carries an independent end-to-end HTTP/3 connection.
+The [HTTP/3 GET example](examples/get/main.rs) opens a single client-relay connection and opens concurrent tunnels with
+potentially varying origins, paths, and priorities. Each tunnel carries an independent end-to-end HTTP/3 connection.
 
 Run it from the repository root:
 
@@ -84,8 +92,7 @@ HTTP/3 DATA frames reliably and is therefore not affected by `--reliable`.
 
 ### Encryption
 
-TLS key exchange prefers hybrid post-quantum `X25519MLKEM768` with classical
-fallbacks by default. `TLS_CURVES_LIST` is configurable in `env.sh`.
+`TLS_CURVES_LIST` is configurable in `env.sh`.
 
 ### Tunnel prioritization
 
