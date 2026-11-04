@@ -9,7 +9,8 @@ Nada is a MASQUE network relay that tunnels TCP and UDP over HTTP/3.
 [![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.1145/3822163.3827938)
 [![DOI](https://zenodo.org/badge/doi/10.1145/3822163.3827938.svg)](https://doi.org/10.2313/NET-2026-05-1_10)
 
-Nada is a prototype implementation based on:
+Nada is compatible with Apple's [NERelay API](https://developer.apple.com/documentation/networkextension/nerelaymanager).
+The prototype implementation is based on:
 
 - [CONNECT-UDP](https://datatracker.ietf.org/doc/rfc9298/) (RFC 9298)
 - [CONNECT](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.4) (RFC 9114)
@@ -17,7 +18,7 @@ Nada is a prototype implementation based on:
 - [HTTP/3 Extended CONNECT](https://www.rfc-editor.org/rfc/rfc9220.html#section-3) (RFC 9220)
 - [HTTP Datagrams and the Capsule Protocol](https://datatracker.ietf.org/doc/rfc9297/) (RFC 9297)
 
-Please cite the paper above if you use Nada in your research.
+Please cite the paper in [CITATION.cff](CITATION.cff) if you use Nada in your research.
 
 ## Setup
 
@@ -50,6 +51,21 @@ dig @127.0.0.1 -p 18018 example.com +notcp +ignore
 dig @::1 -p 18018 example.com +notcp +ignore
 ```
 
+### Library
+
+Nada's Rust library can also be used to open tunnels directly with `connect_udp` or `connect_tcp`.
+
+The [HTTP/3 GET example](examples/get/main.rs) opens a single client-proxy connection and opens concurrent tunnels with potentially
+varying origins, paths, and priorities. Each tunnel carries an independent end-to-end HTTP/3 connection.
+
+Run it from the repository root:
+
+```sh
+cargo run --release --example get
+```
+
+Scenarios can be specified in [scenarios.txt](examples/get/scenarios.txt), c.f. the [example guide](examples/get/README.md).
+
 ### Sending modes
 
 Nada uses unreliable transmission by default.
@@ -70,21 +86,6 @@ HTTP/3 DATA frames reliably and is therefore not affected by `--reliable`.
 
 TLS key exchange prefers hybrid post-quantum `X25519MLKEM768` with classical
 fallbacks by default. `TLS_CURVES_LIST` is configurable in `env.sh`.
-
-### Library
-
-Nada's Rust library can also be used to open tunnels directly with `connect_udp` or `connect_tcp`.
-
-The [HTTP/3 GET example](examples/get/main.rs) opens a single client-proxy connection and opens concurrent tunnels with potentially
-varying origins, paths, and priorities. Each tunnel carries an independent end-to-end HTTP/3 connection.
-
-Run it from the repository root:
-
-```sh
-cargo run --release --example get
-```
-
-Scenarios can be specified in [scenarios.txt](examples/get/scenarios.txt), c.f. the [example guide](examples/get/README.md). 
 
 ### Tunnel prioritization
 
