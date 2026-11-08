@@ -13,7 +13,11 @@ use crate::{
 use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod};
 use foundations::telemetry::log;
 use futures::{SinkExt, StreamExt};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 use tokio::{
     net::{TcpStream, UdpSocket},
     sync::{oneshot, watch},
@@ -21,8 +25,8 @@ use tokio::{
     time::timeout,
 };
 use tokio_quiche::http3::driver::{
-    H3Command, H3Event, InboundFrame, IncomingH3Headers, OutboundFrame, OutboundFrameSender,
-    ServerH3Event, StreamShutdown,
+    H3Command, H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, OutboundFrame,
+    OutboundFrameSender, ServerH3Event, StreamShutdown,
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
@@ -32,6 +36,12 @@ use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths}
 use tokio_quiche::{listen, ConnectionParams, ServerH3Controller, ServerH3Driver};
 
 type RelayResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+// Reserved CONNECT-UDP health service. It never creates a target socket.
+const HEALTH_CHECK_TARGET: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    443,
+);
 
 struct TcpTarget {
     socket: TcpStream,
@@ -193,6 +203,16 @@ async fn handle_connection(
                             continue;
                         }
                         if read_fin { reject(&mut send, b"400").await; continue; }
+                        if target == HEALTH_CHECK_TARGET {
+                            log::info!("UDP health check"; "connection_id" => %connection_id, "stream_id" => stream_id);
+                            let handle = tasks.spawn(async move {
+                                let _datagrams = datagrams;
+                                serve_health_check(send, recv).await;
+                                stream_id
+                            });
+                            running.insert(stream_id, (handle, false));
+                            continue;
+                        }
                         let target_socket = match open_target_socket(target).await {
                             Ok(socket) => socket,
                             Err(err) => { log::warn!("Could not open target UDP socket"; "target" => %target, "error" => %err); reject(&mut send, b"502").await; continue; }
@@ -324,6 +344,35 @@ async fn reject(send: &mut OutboundFrameSender, status: &[u8]) {
         .await;
 }
 
+async fn serve_health_check(mut send: OutboundFrameSender, mut recv: InboundFrameStream) {
+    if send
+        .send(OutboundFrame::Headers(
+            vec![
+                Header::new(b":status", b"200"),
+                Header::new(b"capsule-protocol", b"?1"),
+            ],
+            None,
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    // Keep the accepted stream open long enough for the native establishment
+    // report. Discard payloads and bound the lifetime if a client leaves it open.
+    let _ = timeout(Duration::from_secs(10), async {
+        while let Some(frame) = recv.recv().await {
+            if matches!(frame, InboundFrame::Body(_, true)) {
+                break;
+            }
+        }
+    })
+    .await;
+    let _ = send
+        .send(OutboundFrame::Body(Default::default(), true))
+        .await;
+}
+
 async fn open_target_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
     let bind = if target.is_ipv4() {
         "0.0.0.0:0"
@@ -392,6 +441,35 @@ async fn relay_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_check_accepts_without_target_or_datagram_channels() {
+        let (outgoing, mut response) = tokio::sync::mpsc::channel(4);
+        let (incoming, request) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(serve_health_check(
+            OutboundFrameSender::new(outgoing),
+            request,
+        ));
+        let Some(OutboundFrame::Headers(headers, _)) = response.recv().await else {
+            panic!("health check did not return headers");
+        };
+        assert!(headers
+            .iter()
+            .any(|h| h.name() == b":status" && h.value() == b"200"));
+        assert!(headers
+            .iter()
+            .any(|h| h.name() == b"capsule-protocol" && h.value() == b"?1"));
+        assert!(response.try_recv().is_err());
+        incoming
+            .send(InboundFrame::Body(Default::default(), true))
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert!(
+            matches!(response.recv().await, Some(OutboundFrame::Body(body, true)) if body.is_empty())
+        );
+        assert!(response.recv().await.is_none());
+    }
 
     #[test]
     fn both_tunnel_types_apply_the_same_default_and_custom_port_policy() {
