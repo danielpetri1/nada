@@ -16,7 +16,11 @@ use futures::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tokio::{
     net::{TcpStream, UdpSocket},
@@ -42,6 +46,135 @@ const HEALTH_CHECK_TARGET: SocketAddr = SocketAddr::new(
     IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
     443,
 );
+
+#[derive(Default)]
+struct RequestCounts {
+    received: AtomicU64,
+    rejected: AtomicU64,
+}
+
+struct ConnectionDiagnostics {
+    connection_id: Arc<str>,
+    peer_address: SocketAddr,
+    active_connections: Arc<AtomicU64>,
+    started_at: Instant,
+    requests: Arc<RequestCounts>,
+    close_reason: &'static str,
+    error: Option<String>,
+    quic_error: Option<String>,
+    peer_transport_error: Option<u64>,
+    local_transport_error: Option<u64>,
+    peer_application_error: Option<u64>,
+    local_application_error: Option<u64>,
+}
+
+impl ConnectionDiagnostics {
+    fn new(
+        connection_id: Arc<str>,
+        peer_address: SocketAddr,
+        active_connections: Arc<AtomicU64>,
+        accepted_connections: u64,
+    ) -> Self {
+        let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!("Outer HTTP/3 connection accepted"; "connection_id" => %connection_id, "peer_address" => %peer_address, "accepted_connections" => accepted_connections, "active_connections" => active);
+        Self {
+            connection_id,
+            peer_address,
+            active_connections,
+            started_at: Instant::now(),
+            requests: Arc::default(),
+            close_reason: "task_dropped",
+            error: None,
+            quic_error: None,
+            peer_transport_error: None,
+            local_transport_error: None,
+            peer_application_error: None,
+            local_application_error: None,
+        }
+    }
+}
+
+impl Drop for ConnectionDiagnostics {
+    fn drop(&mut self) {
+        // Count live handlers, including tasks cancelled before their first poll.
+        let active = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        log::info!("Outer HTTP/3 connection closed";
+            "connection_id" => %self.connection_id,
+            "peer_address" => %self.peer_address,
+            "active_connections" => active,
+            "reason" => self.close_reason,
+            "error" => ?self.error,
+            "quic_error" => ?self.quic_error,
+            "peer_transport_error" => ?self.peer_transport_error,
+            "local_transport_error" => ?self.local_transport_error,
+            "peer_application_error" => ?self.peer_application_error,
+            "local_application_error" => ?self.local_application_error,
+            "duration_secs" => self.started_at.elapsed().as_secs_f64(),
+            "requests_received" => self.requests.received.load(Ordering::Relaxed),
+            "requests_rejected" => self.requests.rejected.load(Ordering::Relaxed),
+        );
+    }
+}
+
+struct RequestDiagnostics {
+    connection_id: Arc<str>,
+    stream_id: u64,
+    headers: Vec<Header>,
+    counts: Arc<RequestCounts>,
+}
+
+impl RequestDiagnostics {
+    fn new(connection: &ConnectionDiagnostics, stream_id: u64, headers: Vec<Header>) -> Self {
+        connection.requests.received.fetch_add(1, Ordering::Relaxed);
+        Self {
+            connection_id: connection.connection_id.clone(),
+            stream_id,
+            headers,
+            counts: connection.requests.clone(),
+        }
+    }
+
+    async fn reject(&self, send: &mut OutboundFrameSender, status: &[u8], reason: &str) {
+        self.counts.rejected.fetch_add(1, Ordering::Relaxed);
+        // Only log routing pseudo-headers. Credentials and other headers are omitted.
+        log::warn!("Relay request rejected";
+            "connection_id" => %self.connection_id,
+            "stream_id" => self.stream_id,
+            "status" => %String::from_utf8_lossy(status),
+            "reason" => reason,
+            "method" => %diagnostic_header(&self.headers, b":method"),
+            "protocol" => %diagnostic_header(&self.headers, b":protocol"),
+            "authority" => %diagnostic_header(&self.headers, b":authority"),
+            "path" => %diagnostic_header(&self.headers, b":path"),
+        );
+        let _ = send
+            .send(OutboundFrame::Headers(
+                vec![Header::new(b":status", status)],
+                None,
+            ))
+            .await;
+        let _ = send
+            .send(OutboundFrame::Body(Default::default(), true))
+            .await;
+    }
+}
+
+fn diagnostic_header(headers: &[Header], name: &[u8]) -> String {
+    let Some(value) = headers.iter().find(|h| h.name() == name).map(|h| h.value()) else {
+        return "<missing>".into();
+    };
+    // Escape untrusted bytes and bound each field, including malformed requests.
+    let end = value.len().min(256);
+    format!(
+        "{:?}{}",
+        String::from_utf8_lossy(&value[..end]),
+        if end < value.len() {
+            " [truncated]"
+        } else {
+            ""
+        },
+    )
+}
 
 struct TcpTarget {
     socket: TcpStream,
@@ -102,6 +235,7 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
     log::info!("HTTP/3 relay listening"; "address" => %address);
     let mut connections = JoinSet::new();
     let mut accepted_connections = 0_u64;
+    let active_connections = Arc::new(AtomicU64::new(0));
     loop {
         tokio::select! {
             conn = listeners[0].next() => {
@@ -111,13 +245,25 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
                 let (driver, controller) = ServerH3Driver::new(settings);
                 let connection = conn?.start(driver);
                 accepted_connections += 1;
-                let connection_id = format!("{:?}", connection.scid());
-                log::info!("Outer HTTP/3 connection accepted"; "connection_id" => %connection_id, "accepted_connections" => accepted_connections);
+                let mut diagnostics = ConnectionDiagnostics::new(
+                    format!("{:?}", connection.scid()).into(),
+                    connection.peer_addr(),
+                    active_connections.clone(),
+                    accepted_connections,
+                );
                 let results = args.common.results_dir.clone();
                 let substrate = Substrate::from_reliable(args.reliable);
                 let connect_ports = args.connect_ports.clone();
                 connections.spawn(async move {
-                    handle_connection(controller, connection_id, substrate, Duration::from_secs(args.connect_timeout), connect_ports).await;
+                    (diagnostics.close_reason, diagnostics.error) = handle_connection(controller, &diagnostics, substrate, Duration::from_secs(args.connect_timeout), connect_ports).await;
+                    let audit = connection.audit_log_stats();
+                    diagnostics.quic_error = audit.connection_close_reason().as_ref().map(|error| format!("{error:?}"));
+                    // The audit API uses -1 for codes that were not sent or received.
+                    diagnostics.peer_transport_error = u64::try_from(audit.recvd_conn_close_transport_error_code()).ok();
+                    diagnostics.local_transport_error = u64::try_from(audit.sent_conn_close_transport_error_code()).ok();
+                    diagnostics.peer_application_error = u64::try_from(audit.recvd_conn_close_application_error_code()).ok();
+                    diagnostics.local_application_error = u64::try_from(audit.sent_conn_close_application_error_code()).ok();
+                    drop(diagnostics);
                     if args.log_stats {
                         if let Some(dir) = results {
                             if let Err(err) = write_connection_stats(&connection, &dir, connection.scid()) {
@@ -137,33 +283,44 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
 
 async fn handle_connection(
     mut controller: ServerH3Controller,
-    connection_id: String,
+    diagnostics: &ConnectionDiagnostics,
     substrate: Substrate,
     connect_timeout: Duration,
     connect_ports: Vec<ConnectPort>,
-) {
+) -> (&'static str, Option<String>) {
+    let connection_id = &diagnostics.connection_id;
     let mut datagram_channels = HashMap::new();
     let mut peer_datagrams = false;
     let mut tasks = JoinSet::new();
     let mut running = HashMap::new();
-    loop {
+    let closure = loop {
         tokio::select! {
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Ok(stream_id) = result { running.remove(&stream_id); }
             }
             event = controller.event_receiver_mut().recv() => {
-                let Some(event) = event else { break; };
+                let Some(event) = event else { break ("event_stream_closed", None); };
                 match event {
                     ServerH3Event::Core(H3Event::IncomingSettings { settings }) => {
                         peer_datagrams = settings.contains(&(SETTINGS_H3_DATAGRAM, 1));
                     }
                     ServerH3Event::Core(H3Event::NewFlow { flow_id: quarter_stream_id, send, recv }) => { datagram_channels.insert(quarter_stream_id, (send, recv)); }
                     ServerH3Event::Headers { incoming_headers: IncomingH3Headers { stream_id, headers, mut send, recv, read_fin, .. }, .. } => {
+                        let request = RequestDiagnostics::new(diagnostics, stream_id, headers);
+                        let headers = &request.headers;
                         let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
                         let datagrams = datagram_channels.remove(&(stream_id / 4));
-                        let target = match request_target(&headers, &connect_ports) {
+                        let target = match request_target(headers, &connect_ports) {
                             Ok(target) => target,
-                            Err(status) => { reject(&mut send, status).await; continue; }
+                            Err(status) => {
+                                let reason = match status {
+                                    b"400" => "invalid CONNECT target or pseudo-headers",
+                                    b"403" => "target port is not allowed",
+                                    _ => "unsupported method or CONNECT protocol",
+                                };
+                                request.reject(&mut send, status, reason).await;
+                                continue;
+                            }
                         };
                         if value(b":protocol").is_none() {
                             let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
@@ -175,11 +332,11 @@ async fn handle_connection(
                                 let mut socket = match timeout(connect_timeout, TcpStream::connect(target)).await {
                                     Ok(Ok(socket)) => TcpTarget { socket, finished: false },
                                     result => {
-                                        log::warn!("Could not connect to TCP target"; "target" => %target, "stream_id" => stream_id, "error" => ?result);
-                                        reject(&mut send, if result.is_err() { b"504" } else { b"502" }).await;
+                                        request.reject(&mut send, if result.is_err() { b"504" } else { b"502" }, &format!("could not connect to TCP target {target}: {result:?}")).await;
                                         return stream_id;
                                     }
                                 };
+                                drop(request);
                                 if send.send(OutboundFrame::Headers(vec![Header::new(b":status", b"200")], priority)).await.is_err() {
                                     return stream_id;
                                 }
@@ -202,7 +359,10 @@ async fn handle_connection(
                             running.insert(stream_id, (handle, true));
                             continue;
                         }
-                        if read_fin { reject(&mut send, b"400").await; continue; }
+                        if read_fin {
+                            request.reject(&mut send, b"400", "CONNECT-UDP request has FIN set").await;
+                            continue;
+                        }
                         if target == HEALTH_CHECK_TARGET {
                             log::info!("UDP health check"; "connection_id" => %connection_id, "stream_id" => stream_id);
                             let handle = tasks.spawn(async move {
@@ -215,7 +375,10 @@ async fn handle_connection(
                         }
                         let target_socket = match open_target_socket(target).await {
                             Ok(socket) => socket,
-                            Err(err) => { log::warn!("Could not open target UDP socket"; "target" => %target, "error" => %err); reject(&mut send, b"502").await; continue; }
+                            Err(err) => {
+                                request.reject(&mut send, b"502", &format!("could not open target UDP socket for {target}: {err}")).await;
+                                continue;
+                            }
                         };
                         // Validate the configured outgoing mode before accepting CONNECT.
                         let datagram_maximum = if substrate == Substrate::Datagram && peer_datagrams && datagrams.is_some() {
@@ -235,8 +398,7 @@ async fn handle_connection(
                             Substrate::Datagram => match datagram_maximum {
                                 Some(maximum) if maximum > 0 => maximum.min(MAX_UDP_PAYLOAD),
                                 _ => {
-                                    log::warn!("Rejecting UDP tunnel: configured DATAGRAM sending is unavailable"; "connection_id" => %connection_id, "stream_id" => stream_id, "target" => %target);
-                                    reject(&mut send, b"501").await;
+                                    request.reject(&mut send, b"501", "configured DATAGRAM sending is unavailable").await;
                                     continue;
                                 }
                             },
@@ -245,8 +407,7 @@ async fn handle_connection(
                         let channels = match TunnelChannels::new(send.clone(), recv, datagrams, substrate) {
                             Ok(channels) => channels,
                             Err(err) => {
-                                log::warn!("Could not prepare UDP tunnel channels"; "error" => %err);
-                                reject(&mut send, b"501").await;
+                                request.reject(&mut send, b"501", &format!("could not prepare UDP tunnel channels: {err}")).await;
                                 continue;
                             }
                         };
@@ -281,12 +442,28 @@ async fn handle_connection(
                             if !tcp { handle.abort(); }
                         }
                     }
-                    ServerH3Event::Core(H3Event::ConnectionError(_) | H3Event::ConnectionShutdown(_)) => break,
+                    ServerH3Event::Core(H3Event::ConnectionError(error)) => {
+                        break ("connection_error", Some(format!("{error:?}")));
+                    }
+                    ServerH3Event::Core(H3Event::ConnectionShutdown(error)) => {
+                        break ("connection_shutdown", error.map(|error| format!("{error:?}")));
+                    }
+                    ServerH3Event::Core(H3Event::GoAway { id }) => {
+                        log::info!("Outer HTTP/3 GOAWAY received"; "connection_id" => %connection_id, "id" => id);
+                    }
                     _ => (),
                 }
             }
         }
-    }
+    };
+    drop(tasks);
+    drop(running);
+    drop(datagram_channels);
+    // Terminal HTTP/3 events can precede the final QUIC audit update. The driver
+    // drops the event sender after transport cleanup. Wait for that boundary so
+    // the close record includes peer/local codes and transport-only failures.
+    while controller.event_receiver_mut().recv().await.is_some() {}
+    closure
 }
 
 fn request_target(headers: &[Header], ports: &[ConnectPort]) -> Result<SocketAddr, &'static [u8]> {
@@ -330,18 +507,6 @@ fn tcp_target(headers: &[Header]) -> Option<SocketAddr> {
         return None;
     }
     Some(target)
-}
-
-async fn reject(send: &mut OutboundFrameSender, status: &[u8]) {
-    let _ = send
-        .send(OutboundFrame::Headers(
-            vec![Header::new(b":status", status)],
-            None,
-        ))
-        .await;
-    let _ = send
-        .send(OutboundFrame::Body(Default::default(), true))
-        .await;
 }
 
 async fn serve_health_check(mut send: OutboundFrameSender, mut recv: InboundFrameStream) {
@@ -441,6 +606,83 @@ async fn relay_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_connections_are_released_on_completion_and_cancellation() {
+        let active = Arc::new(AtomicU64::new(0));
+        let first = ConnectionDiagnostics::new(
+            "first".into(),
+            "192.0.2.1:12345".parse().unwrap(),
+            active.clone(),
+            1,
+        );
+        let second = ConnectionDiagnostics::new(
+            "second".into(),
+            "192.0.2.1:12346".parse().unwrap(),
+            active.clone(),
+            2,
+        );
+        assert_eq!(active.load(Ordering::Relaxed), 2);
+        drop(first);
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+        // Abort before the future is polled. Its captured guard must still drop.
+        let task = tokio::spawn(async move {
+            let _diagnostics = second;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn rejection_diagnostics_preserve_http_response_and_count_failed_sends() {
+        let connection = ConnectionDiagnostics::new(
+            "test".into(),
+            "192.0.2.1:12345".parse().unwrap(),
+            Arc::default(),
+            1,
+        );
+        let request =
+            RequestDiagnostics::new(&connection, 248, vec![Header::new(b":method", b"GET")]);
+        let status = request_target(&request.headers, &[ConnectPort::All]).unwrap_err();
+        let (outgoing, mut response) = tokio::sync::mpsc::channel(2);
+        let mut send = OutboundFrameSender::new(outgoing);
+        request
+            .reject(&mut send, status, "unsupported method")
+            .await;
+        let Some(OutboundFrame::Headers(headers, _)) = response.recv().await else {
+            panic!("rejection did not return headers");
+        };
+        assert_eq!(headers, vec![Header::new(b":status", b"405")]);
+        assert!(
+            matches!(response.recv().await, Some(OutboundFrame::Body(body, true)) if body.is_empty())
+        );
+        assert_eq!(connection.requests.received.load(Ordering::Relaxed), 1);
+        assert_eq!(connection.requests.rejected.load(Ordering::Relaxed), 1);
+
+        drop(response);
+        let request = RequestDiagnostics::new(&connection, 252, Vec::new());
+        request.reject(&mut send, b"400", "invalid request").await;
+        assert_eq!(connection.requests.received.load(Ordering::Relaxed), 2);
+        assert_eq!(connection.requests.rejected.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn diagnostic_headers_escape_controls_and_bound_untrusted_values() {
+        let headers = vec![
+            Header::new(b":method", b"CONNECT\r\nforged log\x1b\xff"),
+            Header::new(b":path", &vec![b'x'; 4096]),
+            Header::new(b"authorization", b"secret"),
+        ];
+        let method = diagnostic_header(&headers, b":method");
+        assert!(!method.chars().any(char::is_control));
+        assert!(method.contains("\\r\\n"));
+        let path = diagnostic_header(&headers, b":path");
+        assert_eq!(path.matches('x').count(), 256);
+        assert!(path.ends_with(" [truncated]"));
+        assert_eq!(diagnostic_header(&headers, b":protocol"), "<missing>");
+    }
 
     #[tokio::test]
     async fn health_check_accepts_without_target_or_datagram_channels() {
