@@ -1,7 +1,7 @@
 use crate::args::{ConnectPort, RelayArgs};
 use crate::capsules::{dgram_capsule_from_udp_payload, CapsuleDeframer};
 use crate::dgrams::{decode_dgram, relayed_dgram};
-use crate::helpers::dest_addr_from_masque_uri;
+use crate::helpers::{masque_target, Destination};
 use crate::prios::parse_raw_priority;
 use crate::tcp_tunnel::TcpTunnel;
 use crate::tls::configure_tls;
@@ -133,6 +133,17 @@ impl RequestDiagnostics {
     }
 
     async fn reject(&self, send: &mut OutboundFrameSender, status: &[u8], reason: &str) {
+        self.reject_with_proxy_status(send, status, reason, None)
+            .await;
+    }
+
+    async fn reject_with_proxy_status(
+        &self,
+        send: &mut OutboundFrameSender,
+        status: &[u8],
+        reason: &str,
+        proxy_status: Option<&[u8]>,
+    ) {
         self.counts.rejected.fetch_add(1, Ordering::Relaxed);
         // Only log routing pseudo-headers. Credentials and other headers are omitted.
         log::debug!("Relay request rejected";
@@ -145,12 +156,11 @@ impl RequestDiagnostics {
             "authority" => %diagnostic_header(&self.headers, b":authority"),
             "path" => %diagnostic_header(&self.headers, b":path"),
         );
-        let _ = send
-            .send(OutboundFrame::Headers(
-                vec![Header::new(b":status", status)],
-                None,
-            ))
-            .await;
+        let mut headers = vec![Header::new(b":status", status)];
+        if let Some(value) = proxy_status {
+            headers.push(Header::new(b"proxy-status", value));
+        }
+        let _ = send.send(OutboundFrame::Headers(headers, None)).await;
         let _ = send
             .send(OutboundFrame::Body(Default::default(), true))
             .await;
@@ -180,23 +190,12 @@ struct TcpTarget {
 }
 
 impl TcpTarget {
-    async fn connect(destination: TcpDestination) -> io::Result<(Self, SocketAddr)> {
+    async fn connect(destination: Destination) -> io::Result<(Self, SocketAddr)> {
         let socket = match destination {
-            TcpDestination::Address(address) => TcpStream::connect(address).await?,
-            TcpDestination::Hostname { host, port } => {
-                let addresses: Vec<_> = lookup_host((host.as_str(), port))
-                    .await
-                    .map_err(|error| {
-                        io::Error::new(error.kind(), format!("could not resolve hostname: {error}"))
-                    })?
-                    .filter(usable_tcp_address)
-                    .collect();
-                if addresses.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "hostname resolved to no usable addresses",
-                    ));
-                }
+            Destination::Address(address) => TcpStream::connect(address).await?,
+            Destination::Hostname { host, port } => {
+                let (first, remaining) = resolve_hostname(&host, port).await?;
+                let addresses: Vec<_> = std::iter::once(first).chain(remaining).collect();
                 TcpStream::connect(addresses.as_slice()).await?
             }
         };
@@ -357,8 +356,8 @@ async fn handle_connection(
                         let headers = &request.headers;
                         let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
                         let datagrams = datagram_channels.remove(&(stream_id / 4));
-                        let target = match request_target(headers, &connect_ports) {
-                            Ok(RequestTarget::Udp(target)) => target,
+                        let destination = match request_target(headers, &connect_ports) {
+                            Ok(RequestTarget::Udp(destination)) => destination,
                             Ok(RequestTarget::Tcp(destination)) => {
                                 let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
                                 let commands = controller.h3_cmd_sender();
@@ -403,6 +402,7 @@ async fn handle_connection(
                                 let reason = match status {
                                     b"400" => "invalid CONNECT target or pseudo-headers",
                                     b"403" => "target port is not allowed",
+                                    b"404" => "resource not found",
                                     _ => "unsupported method or CONNECT protocol",
                                 };
                                 request.reject(&mut send, status, reason).await;
@@ -413,55 +413,75 @@ async fn handle_connection(
                             request.reject(&mut send, b"400", "CONNECT-UDP request has FIN set").await;
                             continue;
                         }
-                        let target_socket = match open_target_socket(target).await {
-                            Ok(socket) => socket,
-                            Err(err) => {
-                                request.reject(&mut send, b"502", &format!("could not open target UDP socket for {target}: {err}")).await;
-                                continue;
-                            }
-                        };
-                        // Validate the configured outgoing mode before accepting CONNECT.
-                        let datagram_maximum = if substrate == Substrate::Datagram && peer_datagrams && datagrams.is_some() {
-                            let (reply, response) = oneshot::channel();
-                            let _ = controller.cmd_sender().send(QuicCommand::Custom(Box::new(move |conn| {
-                                let _ = reply.send(conn.dgram_max_writable_len().map(|n| n.saturating_sub(octets::varint_len(stream_id / 4) + 1)));
-                            })));
-                            match timeout(Duration::from_secs(5), response).await {
-                                Ok(Ok(maximum)) => maximum,
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
-                        let maximum = match substrate {
-                            Substrate::Capsule => MAX_UDP_PAYLOAD,
-                            Substrate::Datagram => match datagram_maximum {
-                                Some(maximum) if maximum > 0 => maximum.min(MAX_UDP_PAYLOAD),
-                                _ => {
-                                    request.reject(&mut send, b"501", "configured DATAGRAM sending is unavailable").await;
-                                    continue;
-                                }
-                            },
-                        };
                         let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
-                        let channels = match TunnelChannels::new(send.clone(), recv, datagrams, substrate) {
-                            Ok(channels) => channels,
-                            Err(err) => {
-                                request.reject(&mut send, b"501", &format!("could not prepare UDP tunnel channels: {err}")).await;
-                                continue;
-                            }
-                        };
-                        if send.send(OutboundFrame::Headers(vec![
-                            Header::new(b":status", b"200"),
-                            Header::new(b"capsule-protocol", b"?1"),
-                        ], priority)).await.is_err() { continue; }
-                        log::debug!("UDP tunnel established"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
-                        if maximum < 1200 {
-                            log::debug!("Tunnel cannot carry QUIC's minimum 1200-byte UDP payload"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
-                        }
+                        let quic_commands = controller.cmd_sender();
                         let commands = controller.h3_cmd_sender();
                         let tunnel_connection_id = connection_id.clone();
+                        // Resolve the target in the stream task so DNS cannot stall other streams.
                         let handle = tasks.spawn(async move {
+                            let target = match destination {
+                                Destination::Address(address) => address,
+                                Destination::Hostname { host, port } => {
+                                    match timeout(connect_timeout, resolve_hostname(&host, port)).await {
+                                        Ok(Ok((address, _))) => address,
+                                        Ok(Err(error)) => {
+                                            request.reject_with_proxy_status(&mut send, b"502", &error.to_string(), Some(b"nada; error=dns_error")).await;
+                                            return stream_id;
+                                        }
+                                        Err(_) => {
+                                            request.reject_with_proxy_status(&mut send, b"504", "timed out resolving UDP target hostname", Some(b"nada; error=dns_timeout")).await;
+                                            return stream_id;
+                                        }
+                                    }
+                                }
+                            };
+                            let target_socket = match open_target_socket(target).await {
+                                Ok(socket) => socket,
+                                Err(err) => {
+                                    request.reject(&mut send, b"502", &format!("could not open target UDP socket for {target}: {err}")).await;
+                                    return stream_id;
+                                }
+                            };
+                            // Validate the configured outgoing mode before accepting CONNECT.
+                            let datagram_maximum = if substrate == Substrate::Datagram && peer_datagrams && datagrams.is_some() {
+                                let (reply, response) = oneshot::channel();
+                                let _ = quic_commands.send(QuicCommand::Custom(Box::new(move |conn| {
+                                    let _ = reply.send(conn.dgram_max_writable_len().map(|n| n.saturating_sub(octets::varint_len(stream_id / 4) + 1)));
+                                })));
+                                match timeout(Duration::from_secs(5), response).await {
+                                    Ok(Ok(maximum)) => maximum,
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            let maximum = match substrate {
+                                Substrate::Capsule => MAX_UDP_PAYLOAD,
+                                Substrate::Datagram => match datagram_maximum {
+                                    Some(maximum) if maximum > 0 => maximum.min(MAX_UDP_PAYLOAD),
+                                    _ => {
+                                        request.reject(&mut send, b"501", "configured DATAGRAM sending is unavailable").await;
+                                        return stream_id;
+                                    }
+                                },
+                            };
+                            let channels = match TunnelChannels::new(send.clone(), recv, datagrams, substrate) {
+                                Ok(channels) => channels,
+                                Err(err) => {
+                                    request.reject(&mut send, b"501", &format!("could not prepare UDP tunnel channels: {err}")).await;
+                                    return stream_id;
+                                }
+                            };
+                            if send.send(OutboundFrame::Headers(vec![
+                                Header::new(b":status", b"200"),
+                                Header::new(b"capsule-protocol", b"?1"),
+                            ], priority)).await.is_err() { return stream_id; }
+                            drop(send);
+                            drop(request);
+                            log::debug!("UDP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
+                            if maximum < 1200 {
+                                log::debug!("Tunnel cannot carry QUIC's minimum 1200-byte UDP payload"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
+                            }
                             if let Err(err) = relay_tunnel(target_socket, channels, stream_id / 4, substrate, maximum, &tunnel_connection_id).await {
                                 log::debug!("UDP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum, "error" => %err);
                             }
@@ -507,15 +527,9 @@ async fn handle_connection(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum TcpDestination {
-    Address(SocketAddr),
-    Hostname { host: String, port: u16 },
-}
-
-#[derive(Debug, PartialEq, Eq)]
 enum RequestTarget {
-    Tcp(TcpDestination),
-    Udp(SocketAddr),
+    Tcp(Destination),
+    Udp(Destination),
 }
 
 fn request_target(
@@ -523,30 +537,29 @@ fn request_target(
     ports: &[ConnectPort],
 ) -> Result<RequestTarget, &'static [u8]> {
     let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
-    if value(b":method") != Some(b"CONNECT") {
-        return Err(b"405");
+    match value(b":method") {
+        Some(b"CONNECT") => (),
+        Some(b"GET" | b"HEAD") => return Err(b"404"),
+        _ => return Err(b"405"),
     }
     let target = match value(b":protocol") {
         None => tcp_target(headers).map(RequestTarget::Tcp),
         Some(b"connect-udp") => value(b":path")
-            .and_then(dest_addr_from_masque_uri)
+            .and_then(masque_target)
             .map(RequestTarget::Udp),
         _ => return Err(b"405"),
     }
     .ok_or(b"400".as_slice())?;
-    let port = match &target {
-        RequestTarget::Tcp(TcpDestination::Address(address)) | RequestTarget::Udp(address) => {
-            address.port()
-        }
-        RequestTarget::Tcp(TcpDestination::Hostname { port, .. }) => *port,
+    let destination = match &target {
+        RequestTarget::Tcp(destination) | RequestTarget::Udp(destination) => destination,
     };
-    if !ports.iter().any(|rule| rule.allows(port)) {
+    if !ports.iter().any(|rule| rule.allows(destination.port())) {
         return Err(b"403");
     }
     Ok(target)
 }
 
-fn tcp_target(headers: &[Header]) -> Option<TcpDestination> {
+fn tcp_target(headers: &[Header]) -> Option<Destination> {
     if headers
         .iter()
         .any(|h| h.name().starts_with(b":") && !matches!(h.name(), b":method" | b":authority"))
@@ -563,39 +576,37 @@ fn tcp_target(headers: &[Header]) -> Option<TcpDestination> {
         return None;
     }
     if let Ok(address) = authority.parse() {
-        return usable_tcp_address(&address).then_some(TcpDestination::Address(address));
+        return usable_address(&address).then_some(Destination::Address(address));
     }
 
     let (host, port) = authority.rsplit_once(':')?;
     if !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let port = port.parse().ok()?;
-    if port == 0 || !valid_dns_hostname(host) {
-        return None;
-    }
-    Some(TcpDestination::Hostname {
-        host: host.to_owned(),
-        port,
-    })
+    Destination::hostname(host, port.parse().ok()?)
 }
 
-fn usable_tcp_address(address: &SocketAddr) -> bool {
+fn usable_address(address: &SocketAddr) -> bool {
     address.port() != 0 && !address.ip().is_unspecified() && !address.ip().is_multicast()
 }
 
-fn valid_dns_hostname(host: &str) -> bool {
-    let name = host.strip_suffix('.').unwrap_or(host);
-    name.len() <= 253
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+async fn resolve_hostname(
+    host: &str,
+    port: u16,
+) -> io::Result<(SocketAddr, impl Iterator<Item = SocketAddr> + '_)> {
+    let mut addresses = lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("could not resolve hostname: {error}"))
+        })?
+        .filter(usable_address);
+    let first = addresses.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "hostname resolved to no usable addresses",
+        )
+    })?;
+    Ok((first, addresses))
 }
 
 async fn open_target_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -703,18 +714,26 @@ mod tests {
             Arc::default(),
             1,
         );
-        let request =
-            RequestDiagnostics::new(&connection, 248, vec![Header::new(b":method", b"GET")]);
+        let request = RequestDiagnostics::new(
+            &connection,
+            248,
+            vec![
+                Header::new(b":method", b"GET"),
+                Header::new(b":scheme", b"https"),
+                Header::new(b":authority", b"relay.example:4431"),
+                Header::new(b":path", b"/"),
+            ],
+        );
         let status = request_target(&request.headers, &[ConnectPort::All]).unwrap_err();
         let (outgoing, mut response) = tokio::sync::mpsc::channel(2);
         let mut send = OutboundFrameSender::new(outgoing);
         request
-            .reject(&mut send, status, "unsupported method")
+            .reject(&mut send, status, "resource not found")
             .await;
         let Some(OutboundFrame::Headers(headers, _)) = response.recv().await else {
             panic!("rejection did not return headers");
         };
-        assert_eq!(headers, vec![Header::new(b":status", b"405")]);
+        assert_eq!(headers, vec![Header::new(b":status", b"404")]);
         assert!(
             matches!(response.recv().await, Some(OutboundFrame::Body(body, true)) if body.is_empty())
         );
@@ -795,9 +814,9 @@ mod tests {
                         } else if !allowed {
                             Err(b"403".as_slice())
                         } else if udp {
-                            Ok(RequestTarget::Udp(target))
+                            Ok(RequestTarget::Udp(Destination::Address(target)))
                         } else {
-                            Ok(RequestTarget::Tcp(TcpDestination::Address(target)))
+                            Ok(RequestTarget::Tcp(Destination::Address(target)))
                         };
                         assert_eq!(request_target(&headers, ports), expected);
                     }
@@ -811,19 +830,46 @@ mod tests {
     }
 
     #[test]
-    fn health_requests_are_not_forwarded() {
+    fn get_and_head_return_not_found_for_unserved_resources() {
         for method in [b"GET".as_slice(), b"HEAD"] {
-            let headers = [
-                Header::new(b":method", method),
-                Header::new(b":scheme", b"https"),
-                Header::new(b":authority", b"relay.example:4431"),
-                Header::new(b":path", b"/health"),
-            ];
-            assert_eq!(
-                request_target(&headers, &[ConnectPort::All]),
-                Err(b"405".as_slice())
-            );
+            for path in [b"/".as_slice(), b"/health", b"/.well-known/pvd"] {
+                let headers = [
+                    Header::new(b":method", method),
+                    Header::new(b":scheme", b"https"),
+                    Header::new(b":authority", b"relay.example:4431"),
+                    Header::new(b":path", path),
+                ];
+                assert_eq!(
+                    request_target(&headers, &[ConnectPort::All]),
+                    Err(b"404".as_slice())
+                );
+            }
         }
+    }
+
+    #[test]
+    fn connect_udp_hostname_uses_the_path_and_applies_the_port_policy() {
+        let headers = [
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-udp"),
+            Header::new(b":scheme", b"https"),
+            Header::new(b":authority", b"relay.example:4431"),
+            Header::new(
+                b":path",
+                b"/.well-known/masque/udp/p167-contacts.icloud.com/443/",
+            ),
+        ];
+        assert_eq!(
+            request_target(&headers, &["443".parse().unwrap()]),
+            Ok(RequestTarget::Udp(Destination::Hostname {
+                host: "p167-contacts.icloud.com".into(),
+                port: 443,
+            }))
+        );
+        assert_eq!(
+            request_target(&headers, &["53".parse().unwrap()]),
+            Err(b"403".as_slice())
+        );
     }
 
     #[test]
@@ -842,7 +888,7 @@ mod tests {
             ];
             assert_eq!(
                 request_target(&headers, &https),
-                Ok(RequestTarget::Tcp(TcpDestination::Hostname {
+                Ok(RequestTarget::Tcp(Destination::Hostname {
                     host: host.into(),
                     port: 443,
                 }))
@@ -856,15 +902,15 @@ mod tests {
         for (authority, destination) in [
             (
                 "1.1.1.1:53",
-                TcpDestination::Address("1.1.1.1:53".parse().unwrap()),
+                Destination::Address("1.1.1.1:53".parse().unwrap()),
             ),
             (
                 "[2606:4700:4700::1111]:443",
-                TcpDestination::Address("[2606:4700:4700::1111]:443".parse().unwrap()),
+                Destination::Address("[2606:4700:4700::1111]:443".parse().unwrap()),
             ),
             (
                 "example.com:443",
-                TcpDestination::Hostname {
+                Destination::Hostname {
                     host: "example.com".into(),
                     port: 443,
                 },

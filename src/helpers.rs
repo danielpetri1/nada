@@ -1,3 +1,4 @@
+use percent_encoding::percent_decode;
 use sfv::{BareItem, FieldType, Item};
 use std::net::SocketAddr;
 
@@ -8,6 +9,48 @@ pub fn connect_udp_path(target: SocketAddr) -> String {
 }
 
 pub fn dest_addr_from_masque_uri(target_path: &[u8]) -> Option<SocketAddr> {
+    match masque_target(target_path)? {
+        Destination::Address(address) => Some(address),
+        Destination::Hostname { .. } => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Destination {
+    Address(SocketAddr),
+    Hostname { host: String, port: u16 },
+}
+
+impl Destination {
+    pub(crate) fn hostname(host: &str, port: u16) -> Option<Self> {
+        let name = host.strip_suffix('.').unwrap_or(host);
+        if port == 0 || name.len() > 253 {
+            return None;
+        }
+        let valid = name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+        valid.then(|| Self::Hostname {
+            host: host.to_owned(),
+            port,
+        })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        match self {
+            Self::Address(address) => address.port(),
+            Self::Hostname { port, .. } => *port,
+        }
+    }
+}
+
+pub(crate) fn masque_target(target_path: &[u8]) -> Option<Destination> {
     let path_str = str::from_utf8(target_path).ok()?;
     let parts: Vec<&str> = path_str
         .strip_suffix('/')
@@ -16,13 +59,16 @@ pub fn dest_addr_from_masque_uri(target_path: &[u8]) -> Option<SocketAddr> {
         .collect();
 
     match parts.as_slice() {
-        ["", ".well-known", "masque", "udp", ip, port] => {
-            let ip = ip.replace("%3A", ":").replace("%3a", ":");
+        ["", ".well-known", "masque", "udp", host, port] => {
+            let host = percent_decode(host.as_bytes()).decode_utf8().ok()?;
             let port = port.parse().ok()?;
             if port == 0 {
                 return None;
             }
-            Some(SocketAddr::new(ip.parse().ok()?, port))
+            match host.parse() {
+                Ok(ip) => Some(Destination::Address(SocketAddr::new(ip, port))),
+                Err(_) => Destination::hostname(&host, port),
+            }
         }
         _ => None,
     }
@@ -87,6 +133,22 @@ mod tests {
             assert!(!path.contains(':'));
             assert!(path.ends_with('/'));
             assert_eq!(dest_addr_from_masque_uri(path.as_bytes()), Some(target));
+        }
+    }
+
+    #[test]
+    fn decodes_udp_hostnames_without_accepting_invalid_authority_characters() {
+        assert_eq!(
+            masque_target(b"/.well-known/masque/udp/a%2Eexample/443/"),
+            Some(Destination::Hostname {
+                host: "a.example".into(),
+                port: 443,
+            })
+        );
+        for host in ["a%2Fexample", "a%40example", "a%ff.example", "a..example"] {
+            assert!(
+                masque_target(format!("/.well-known/masque/udp/{host}/443/").as_bytes()).is_none()
+            );
         }
     }
 }

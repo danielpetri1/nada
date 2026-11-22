@@ -158,7 +158,7 @@ pub struct RelayArgs {
     #[arg(long)]
     pub reliable: bool,
 
-    /// Time allowed for hostname resolution and the outgoing TCP connection for each CONNECT tunnel.
+    /// Time allowed for destination DNS resolution and, for TCP tunnels, connecting to the destination.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub connect_timeout: u64,
 

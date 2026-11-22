@@ -1642,6 +1642,7 @@ dependencies = [
  "foundations",
  "futures",
  "octets",
+ "percent-encoding",
  "quiche",
  "serde_json",
  "sfv",
