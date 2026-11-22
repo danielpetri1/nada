@@ -15,6 +15,7 @@ use foundations::telemetry::log;
 use futures::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
+    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -23,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    net::{TcpStream, UdpSocket},
+    net::{lookup_host, TcpStream, UdpSocket},
     sync::{oneshot, watch},
     task::JoinSet,
     time::timeout,
@@ -178,6 +179,36 @@ struct TcpTarget {
     finished: bool,
 }
 
+impl TcpTarget {
+    async fn connect(destination: TcpDestination) -> io::Result<(Self, SocketAddr)> {
+        let socket = match destination {
+            TcpDestination::Address(address) => TcpStream::connect(address).await?,
+            TcpDestination::Hostname { host, port } => {
+                let addresses: Vec<_> = lookup_host((host.as_str(), port))
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(error.kind(), format!("could not resolve hostname: {error}"))
+                    })?
+                    .filter(usable_tcp_address)
+                    .collect();
+                if addresses.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "hostname resolved to no usable addresses",
+                    ));
+                }
+                TcpStream::connect(addresses.as_slice()).await?
+            }
+        };
+        let target = Self {
+            socket,
+            finished: false,
+        };
+        let address = target.socket.peer_addr()?;
+        Ok((target, address))
+    }
+}
+
 impl Drop for TcpTarget {
     #[allow(deprecated)]
     fn drop(&mut self) {
@@ -327,7 +358,47 @@ async fn handle_connection(
                         let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
                         let datagrams = datagram_channels.remove(&(stream_id / 4));
                         let target = match request_target(headers, &connect_ports) {
-                            Ok(target) => target,
+                            Ok(RequestTarget::Udp(target)) => target,
+                            Ok(RequestTarget::Tcp(destination)) => {
+                                let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
+                                let commands = controller.h3_cmd_sender();
+                                let tunnel_connection_id = connection_id.clone();
+                                // Resolve and connect without blocking other streams on this connection.
+                                let handle = tasks.spawn(async move {
+                                    let (mut socket, target) = match timeout(connect_timeout, TcpTarget::connect(destination)).await {
+                                        Ok(Ok(connected)) => connected,
+                                        Ok(Err(error)) => {
+                                            request.reject(&mut send, b"502", &format!("could not connect to TCP target: {error}")).await;
+                                            return stream_id;
+                                        }
+                                        Err(_) => {
+                                            request.reject(&mut send, b"504", "timed out establishing TCP tunnel").await;
+                                            return stream_id;
+                                        }
+                                    };
+                                    drop(request);
+                                    if send.send(OutboundFrame::Headers(vec![Header::new(b":status", b"200")], priority)).await.is_err() {
+                                        return stream_id;
+                                    }
+                                    let (_state, status) = watch::channel(TunnelState::Open);
+                                    let mut tunnel = TcpTunnel::new(target, stream_id, send, recv, read_fin, status, move || {
+                                        let _ = commands.send(H3Command::ShutdownStream {
+                                            stream_id,
+                                            shutdown: StreamShutdown::Both { read_error_code: WireErrorCode::ConnectError as u64, write_error_code: WireErrorCode::ConnectError as u64 },
+                                        });
+                                    });
+                                    log::debug!("TCP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id);
+                                    match tokio::io::copy_bidirectional(&mut socket.socket, &mut tunnel).await {
+                                        Ok(_) => socket.finished = true,
+                                        Err(error) => {
+                                            log::debug!("TCP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "error" => %error);
+                                        }
+                                    }
+                                    stream_id
+                                });
+                                running.insert(stream_id, (handle, true));
+                                continue;
+                            }
                             Err(status) => {
                                 let reason = match status {
                                     b"400" => "invalid CONNECT target or pseudo-headers",
@@ -338,43 +409,6 @@ async fn handle_connection(
                                 continue;
                             }
                         };
-                        if value(b":protocol").is_none() {
-                            let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
-                            let commands = controller.h3_cmd_sender();
-                            let tunnel_connection_id = connection_id.clone();
-                            // A slow TCP handshake must not stall other streams,
-                            // including CONNECT-UDP on this same connection.
-                            let handle = tasks.spawn(async move {
-                                let mut socket = match timeout(connect_timeout, TcpStream::connect(target)).await {
-                                    Ok(Ok(socket)) => TcpTarget { socket, finished: false },
-                                    result => {
-                                        request.reject(&mut send, if result.is_err() { b"504" } else { b"502" }, &format!("could not connect to TCP target {target}: {result:?}")).await;
-                                        return stream_id;
-                                    }
-                                };
-                                drop(request);
-                                if send.send(OutboundFrame::Headers(vec![Header::new(b":status", b"200")], priority)).await.is_err() {
-                                    return stream_id;
-                                }
-                                let (_state, status) = watch::channel(TunnelState::Open);
-                                let mut tunnel = TcpTunnel::new(target, stream_id, send, recv, read_fin, status, move || {
-                                    let _ = commands.send(H3Command::ShutdownStream {
-                                        stream_id,
-                                        shutdown: StreamShutdown::Both { read_error_code: WireErrorCode::ConnectError as u64, write_error_code: WireErrorCode::ConnectError as u64 },
-                                    });
-                                });
-                                log::debug!("TCP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id);
-                                match tokio::io::copy_bidirectional(&mut socket.socket, &mut tunnel).await {
-                                    Ok(_) => socket.finished = true,
-                                    Err(error) => {
-                                        log::debug!("TCP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "error" => %error);
-                                    }
-                                }
-                                stream_id
-                            });
-                            running.insert(stream_id, (handle, true));
-                            continue;
-                        }
                         if read_fin {
                             request.reject(&mut send, b"400", "CONNECT-UDP request has FIN set").await;
                             continue;
@@ -472,24 +506,47 @@ async fn handle_connection(
     closure
 }
 
-fn request_target(headers: &[Header], ports: &[ConnectPort]) -> Result<SocketAddr, &'static [u8]> {
+#[derive(Debug, PartialEq, Eq)]
+enum TcpDestination {
+    Address(SocketAddr),
+    Hostname { host: String, port: u16 },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestTarget {
+    Tcp(TcpDestination),
+    Udp(SocketAddr),
+}
+
+fn request_target(
+    headers: &[Header],
+    ports: &[ConnectPort],
+) -> Result<RequestTarget, &'static [u8]> {
     let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
     if value(b":method") != Some(b"CONNECT") {
         return Err(b"405");
     }
     let target = match value(b":protocol") {
-        None => tcp_target(headers),
-        Some(b"connect-udp") => value(b":path").and_then(dest_addr_from_masque_uri),
+        None => tcp_target(headers).map(RequestTarget::Tcp),
+        Some(b"connect-udp") => value(b":path")
+            .and_then(dest_addr_from_masque_uri)
+            .map(RequestTarget::Udp),
         _ => return Err(b"405"),
     }
     .ok_or(b"400".as_slice())?;
-    if !ports.iter().any(|rule| rule.allows(target.port())) {
+    let port = match &target {
+        RequestTarget::Tcp(TcpDestination::Address(address)) | RequestTarget::Udp(address) => {
+            address.port()
+        }
+        RequestTarget::Tcp(TcpDestination::Hostname { port, .. }) => *port,
+    };
+    if !ports.iter().any(|rule| rule.allows(port)) {
         return Err(b"403");
     }
     Ok(target)
 }
 
-fn tcp_target(headers: &[Header]) -> Option<SocketAddr> {
+fn tcp_target(headers: &[Header]) -> Option<TcpDestination> {
     if headers
         .iter()
         .any(|h| h.name().starts_with(b":") && !matches!(h.name(), b":method" | b":authority"))
@@ -501,18 +558,44 @@ fn tcp_target(headers: &[Header]) -> Option<SocketAddr> {
         return None;
     }
     let mut authorities = headers.iter().filter(|h| h.name() == b":authority");
-    let target: SocketAddr = std::str::from_utf8(authorities.next()?.value())
-        .ok()?
-        .parse()
-        .ok()?;
-    if authorities.next().is_some()
-        || target.port() == 0
-        || target.ip().is_unspecified()
-        || target.ip().is_multicast()
-    {
+    let authority = std::str::from_utf8(authorities.next()?.value()).ok()?;
+    if authorities.next().is_some() {
         return None;
     }
-    Some(target)
+    if let Ok(address) = authority.parse() {
+        return usable_tcp_address(&address).then_some(TcpDestination::Address(address));
+    }
+
+    let (host, port) = authority.rsplit_once(':')?;
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let port = port.parse().ok()?;
+    if port == 0 || !valid_dns_hostname(host) {
+        return None;
+    }
+    Some(TcpDestination::Hostname {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+fn usable_tcp_address(address: &SocketAddr) -> bool {
+    address.port() != 0 && !address.ip().is_unspecified() && !address.ip().is_multicast()
+}
+
+fn valid_dns_hostname(host: &str) -> bool {
+    let name = host.strip_suffix('.').unwrap_or(host);
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 async fn open_target_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
@@ -699,30 +782,25 @@ mod tests {
                             Header::new(b":authority", target.to_string().as_bytes()),
                         ]
                     };
-                    let expected = if port == 0 {
-                        Err(b"400".as_slice())
-                    } else if [53, 80, 443, 4433].contains(&port) {
-                        Ok(target)
-                    } else {
-                        Err(b"403".as_slice())
-                    };
-                    assert_eq!(request_target(&headers, &default.connect_ports), expected);
-                    let expected = if port == 0 {
-                        Err(b"400".as_slice())
-                    } else if port == 8443 {
-                        Ok(target)
-                    } else {
-                        Err(b"403".as_slice())
-                    };
-                    assert_eq!(request_target(&headers, &custom_ports), expected);
-                    assert_eq!(
-                        request_target(&headers, &[ConnectPort::All]),
-                        if port == 0 {
+                    for (ports, allowed) in [
+                        (
+                            default.connect_ports.as_slice(),
+                            [53, 80, 443, 4433].contains(&port),
+                        ),
+                        (custom_ports.as_slice(), port == 8443),
+                        (&[ConnectPort::All], true),
+                    ] {
+                        let expected = if port == 0 {
                             Err(b"400".as_slice())
+                        } else if !allowed {
+                            Err(b"403".as_slice())
+                        } else if udp {
+                            Ok(RequestTarget::Udp(target))
                         } else {
-                            Ok(target)
-                        },
-                    );
+                            Ok(RequestTarget::Tcp(TcpDestination::Address(target)))
+                        };
+                        assert_eq!(request_target(&headers, ports), expected);
+                    }
                 }
             }
         }
@@ -749,13 +827,54 @@ mod tests {
     }
 
     #[test]
+    fn connect_hostname_uses_the_authority_and_applies_the_port_policy() {
+        let https = ["443".parse::<ConnectPort>().unwrap()];
+        let dns = ["53".parse::<ConnectPort>().unwrap()];
+        for host in [
+            "bag.itunes.apple.com",
+            "releases.obsidian.md",
+            "raw.githubusercontent.com",
+            "A-1.example.",
+        ] {
+            let headers = [
+                Header::new(b":method", b"CONNECT"),
+                Header::new(b":authority", format!("{host}:443").as_bytes()),
+            ];
+            assert_eq!(
+                request_target(&headers, &https),
+                Ok(RequestTarget::Tcp(TcpDestination::Hostname {
+                    host: host.into(),
+                    port: 443,
+                }))
+            );
+            assert_eq!(request_target(&headers, &dns), Err(b"403".as_slice()));
+        }
+    }
+
+    #[test]
     fn connect_authority_requires_an_explicit_valid_port_and_no_scheme_or_path() {
-        for target in ["1.1.1.1:53", "[2606:4700:4700::1111]:443"] {
+        for (authority, destination) in [
+            (
+                "1.1.1.1:53",
+                TcpDestination::Address("1.1.1.1:53".parse().unwrap()),
+            ),
+            (
+                "[2606:4700:4700::1111]:443",
+                TcpDestination::Address("[2606:4700:4700::1111]:443".parse().unwrap()),
+            ),
+            (
+                "example.com:443",
+                TcpDestination::Hostname {
+                    host: "example.com".into(),
+                    port: 443,
+                },
+            ),
+        ] {
             let headers = vec![
                 Header::new(b":method", b"CONNECT"),
-                Header::new(b":authority", target.as_bytes()),
+                Header::new(b":authority", authority.as_bytes()),
             ];
-            assert_eq!(tcp_target(&headers), Some(target.parse().unwrap()));
+            assert_eq!(tcp_target(&headers), Some(destination));
             for name in [
                 b":scheme".as_slice(),
                 b":path",
@@ -781,6 +900,21 @@ mod tests {
             "[ff02::1]:53",
             "https://1.1.1.1:443",
             "user@1.1.1.1:53",
+            ":443",
+            "example.com",
+            "example.com:",
+            "example.com:0",
+            "example.com:65536",
+            "example.com:+443",
+            "example.com:443/path",
+            "user@example.com:443",
+            "example..com:443",
+            "-example.com:443",
+            "example-.com:443",
+            "example.com..:443",
+            "example.com :443",
+            r"raw\.githubusercontent.com:443",
+            "2001:db8::1:443",
         ] {
             assert!(
                 tcp_target(&[

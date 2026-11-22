@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
   <title id="title">Nada</title>
-  <desc id="description">The relay for an agentic Internet. Layered curved transport lines form a tunnel gradient around the empty-set symbol and Nada wordmark.</desc>
+  <desc id="description">Your sovereign agentic relay. Layered curved transport lines form a tunnel gradient around the empty-set symbol and Nada wordmark.</desc>
   <style>
     .wordmark { fill: currentColor; }
     .tagline { fill: currentColor; opacity: .7; }
@@ -49,7 +49,7 @@
         <text class="wordmark" x="180" y="156" font-size="80" font-weight="400" letter-spacing="-4.4">Nada</text>
       </g>
 
-      <text class="tagline" x="640" y="460" font-size="40">The relay for an agentic Internet</text>
+      <text class="tagline" x="640" y="460" font-size="40">Your sovereign agentic relay</text>
     </g>
   </defs>
 

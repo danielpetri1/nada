@@ -40,6 +40,7 @@ bash build.sh
 
 Applications can connect to Nada's local TCP or UDP listeners at `[::1]:18018` or `127.0.0.1:18018`.
 Using the CLI for local testing requires specifying a `--target` to which all flows are sent.
+The relay accepts IP addresses and DNS hostnames as TCP CONNECT destinations.
 
 ```sh
 # See available options
