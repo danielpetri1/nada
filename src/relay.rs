@@ -10,7 +10,7 @@ use crate::{
     tls_curves_list, write_connection_stats, MAX_OUTER_QUIC_PACKET_SIZE, MAX_STREAMS,
     SETTINGS_H3_DATAGRAM,
 };
-use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod};
+use boring::ssl::{SslContextBuilder, SslFiletype, SslMethod, SslVersion};
 use foundations::telemetry::log;
 use futures::{SinkExt, StreamExt};
 use std::{
@@ -40,6 +40,9 @@ use tokio_quiche::settings::{CertificateKind, QuicSettings, TlsCertificatePaths}
 use tokio_quiche::{listen, ConnectionParams, ServerH3Controller, ServerH3Driver};
 
 type RelayResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+const CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
+const INITIAL_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
 
 // Reserved CONNECT-UDP health service. It never creates a target socket.
 const HEALTH_CHECK_TARGET: SocketAddr = SocketAddr::new(
@@ -205,6 +208,11 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
     settings.enable_pacing = true;
     settings.max_idle_timeout = Some(Duration::ZERO);
     settings.cc_algorithm = args.common.cc_algorithm;
+    settings.initial_max_data = CONNECTION_WINDOW;
+    settings.max_connection_window = CONNECTION_WINDOW;
+    settings.initial_max_stream_data_bidi_local = INITIAL_STREAM_WINDOW;
+    settings.initial_max_stream_data_bidi_remote = INITIAL_STREAM_WINDOW;
+    settings.initial_max_stream_data_uni = INITIAL_STREAM_WINDOW;
     settings.initial_max_streams_uni = MAX_STREAMS;
     settings.initial_max_streams_bidi = MAX_STREAMS;
     settings.max_send_udp_payload_size = MAX_OUTER_QUIC_PACKET_SIZE;
@@ -227,6 +235,7 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
         Default::default(),
     );
     let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+    builder.set_min_proto_version(Some(SslVersion::TLS1_3))?;
     builder.set_certificate_chain_file(&args.cert)?;
     builder.set_private_key_file(&args.key, SslFiletype::PEM)?;
     builder.check_private_key()?;
