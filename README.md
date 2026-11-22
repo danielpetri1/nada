@@ -74,15 +74,6 @@ cargo run --release --example get
 
 Scenarios can be specified in [scenarios.txt](examples/get/scenarios.txt), c.f. the [example guide](examples/get/README.md).
 
-### Relay health check
-
-CONNECT-UDP to `[2001:db8::1]:443` is a reserved health service. The relay returns
-`200` without opening a target socket or sending target traffic. It requires port
-443 to be allowed by `--connect-port`. DATAGRAM negotiation is not required because
-this service sends no UDP payloads. The client should close the accepted stream;
-the relay closes it after ten seconds at most. TCP CONNECT to that address and
-all other UDP destinations retain their ordinary forwarding behavior.
-
 ### Sending modes
 
 Nada uses unreliable transmission by default.
