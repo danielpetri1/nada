@@ -24,7 +24,7 @@ pub struct Args {
     pub qlog: bool,
 
     /// Log verbosity level.
-    #[arg(long, default_value = "info", value_enum)]
+    #[arg(long, visible_alias = "loglevel", default_value = "info", value_enum)]
     pub log_level: LogLevel,
 
     /// QUIC congestion control for local sends (GET example: both inner and outer).
