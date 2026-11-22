@@ -15,7 +15,7 @@ use foundations::telemetry::log;
 use futures::{SinkExt, StreamExt};
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -29,8 +29,8 @@ use tokio::{
     time::timeout,
 };
 use tokio_quiche::http3::driver::{
-    H3Command, H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, OutboundFrame,
-    OutboundFrameSender, ServerH3Event, StreamShutdown,
+    H3Command, H3Event, InboundFrame, IncomingH3Headers, OutboundFrame, OutboundFrameSender,
+    ServerH3Event, StreamShutdown,
 };
 use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
@@ -43,12 +43,6 @@ type RelayResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 const CONNECTION_WINDOW: u64 = 8 * 1024 * 1024;
 const INITIAL_STREAM_WINDOW: u64 = 2 * 1024 * 1024;
-
-// Reserved CONNECT-UDP health service. It never creates a target socket.
-const HEALTH_CHECK_TARGET: SocketAddr = SocketAddr::new(
-    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
-    443,
-);
 
 #[derive(Default)]
 struct RequestCounts {
@@ -79,7 +73,7 @@ impl ConnectionDiagnostics {
         accepted_connections: u64,
     ) -> Self {
         let active = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
-        log::info!("Outer HTTP/3 connection accepted"; "connection_id" => %connection_id, "peer_address" => %peer_address, "accepted_connections" => accepted_connections, "active_connections" => active);
+        log::debug!("Outer HTTP/3 connection accepted"; "connection_id" => %connection_id, "peer_address" => %peer_address, "accepted_connections" => accepted_connections, "active_connections" => active);
         Self {
             connection_id,
             peer_address,
@@ -101,7 +95,7 @@ impl Drop for ConnectionDiagnostics {
     fn drop(&mut self) {
         // Count live handlers, including tasks cancelled before their first poll.
         let active = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
-        log::info!("Outer HTTP/3 connection closed";
+        log::debug!("Outer HTTP/3 connection closed";
             "connection_id" => %self.connection_id,
             "peer_address" => %self.peer_address,
             "active_connections" => active,
@@ -140,7 +134,7 @@ impl RequestDiagnostics {
     async fn reject(&self, send: &mut OutboundFrameSender, status: &[u8], reason: &str) {
         self.counts.rejected.fetch_add(1, Ordering::Relaxed);
         // Only log routing pseudo-headers. Credentials and other headers are omitted.
-        log::warn!("Relay request rejected";
+        log::debug!("Relay request rejected";
             "connection_id" => %self.connection_id,
             "stream_id" => self.stream_id,
             "status" => %String::from_utf8_lossy(status),
@@ -245,8 +239,21 @@ pub(crate) async fn serve_socket(socket: UdpSocket, args: RelayArgs) -> RelayRes
     let mut connections = JoinSet::new();
     let mut accepted_connections = 0_u64;
     let active_connections = Arc::new(AtomicU64::new(0));
+    let report_period = Duration::from_secs(60);
+    let mut report =
+        tokio::time::interval_at(tokio::time::Instant::now() + report_period, report_period);
+    report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_counts = (0, 0);
     loop {
         tokio::select! {
+            _ = report.tick() => {
+                let active = active_connections.load(Ordering::Relaxed);
+                let counts = (accepted_connections, active);
+                if counts != last_counts {
+                    log::info!("Relay connection totals"; "accepted_connections" => accepted_connections, "active_connections" => active);
+                    last_counts = counts;
+                }
+            }
             conn = listeners[0].next() => {
                 let Some(conn) = conn else { break; };
                 let mut settings = Http3Settings::default();
@@ -356,11 +363,11 @@ async fn handle_connection(
                                         shutdown: StreamShutdown::Both { read_error_code: WireErrorCode::ConnectError as u64, write_error_code: WireErrorCode::ConnectError as u64 },
                                     });
                                 });
-                                log::info!("TCP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id);
+                                log::debug!("TCP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id);
                                 match tokio::io::copy_bidirectional(&mut socket.socket, &mut tunnel).await {
                                     Ok(_) => socket.finished = true,
                                     Err(error) => {
-                                        log::warn!("TCP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "error" => %error);
+                                        log::debug!("TCP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "error" => %error);
                                     }
                                 }
                                 stream_id
@@ -370,16 +377,6 @@ async fn handle_connection(
                         }
                         if read_fin {
                             request.reject(&mut send, b"400", "CONNECT-UDP request has FIN set").await;
-                            continue;
-                        }
-                        if target == HEALTH_CHECK_TARGET {
-                            log::info!("UDP health check"; "connection_id" => %connection_id, "stream_id" => stream_id);
-                            let handle = tasks.spawn(async move {
-                                let _datagrams = datagrams;
-                                serve_health_check(send, recv).await;
-                                stream_id
-                            });
-                            running.insert(stream_id, (handle, false));
                             continue;
                         }
                         let target_socket = match open_target_socket(target).await {
@@ -424,15 +421,15 @@ async fn handle_connection(
                             Header::new(b":status", b"200"),
                             Header::new(b"capsule-protocol", b"?1"),
                         ], priority)).await.is_err() { continue; }
-                        log::info!("UDP tunnel established"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
+                        log::debug!("UDP tunnel established"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
                         if maximum < 1200 {
-                            log::warn!("Tunnel cannot carry QUIC's minimum 1200-byte UDP payload"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
+                            log::debug!("Tunnel cannot carry QUIC's minimum 1200-byte UDP payload"; "target" => %target, "connection_id" => %connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum);
                         }
                         let commands = controller.h3_cmd_sender();
                         let tunnel_connection_id = connection_id.clone();
                         let handle = tasks.spawn(async move {
                             if let Err(err) = relay_tunnel(target_socket, channels, stream_id / 4, substrate, maximum, &tunnel_connection_id).await {
-                                log::warn!("UDP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum, "error" => %err);
+                                log::debug!("UDP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "sending_mode" => ?substrate, "max_payload" => maximum, "error" => %err);
                             }
                             let _ = commands.send(H3Command::ShutdownStream { stream_id, shutdown: StreamShutdown::Both { read_error_code: 0, write_error_code: 0 } });
                             stream_id
@@ -458,7 +455,7 @@ async fn handle_connection(
                         break ("connection_shutdown", error.map(|error| format!("{error:?}")));
                     }
                     ServerH3Event::Core(H3Event::GoAway { id }) => {
-                        log::info!("Outer HTTP/3 GOAWAY received"; "connection_id" => %connection_id, "id" => id);
+                        log::debug!("Outer HTTP/3 GOAWAY received"; "connection_id" => %connection_id, "id" => id);
                     }
                     _ => (),
                 }
@@ -518,35 +515,6 @@ fn tcp_target(headers: &[Header]) -> Option<SocketAddr> {
     Some(target)
 }
 
-async fn serve_health_check(mut send: OutboundFrameSender, mut recv: InboundFrameStream) {
-    if send
-        .send(OutboundFrame::Headers(
-            vec![
-                Header::new(b":status", b"200"),
-                Header::new(b"capsule-protocol", b"?1"),
-            ],
-            None,
-        ))
-        .await
-        .is_err()
-    {
-        return;
-    }
-    // Keep the accepted stream open long enough for the native establishment
-    // report. Discard payloads and bound the lifetime if a client leaves it open.
-    let _ = timeout(Duration::from_secs(10), async {
-        while let Some(frame) = recv.recv().await {
-            if matches!(frame, InboundFrame::Body(_, true)) {
-                break;
-            }
-        }
-    })
-    .await;
-    let _ = send
-        .send(OutboundFrame::Body(Default::default(), true))
-        .await;
-}
-
 async fn open_target_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
     let bind = if target.is_ipv4() {
         "0.0.0.0:0"
@@ -574,7 +542,7 @@ async fn relay_tunnel(
             result = socket.recv(&mut buffer) => {
                 let len = result?;
                 if len > maximum {
-                    log::warn!("Dropping oversized target datagram"; "target" => %target, "connection_id" => connection_id, "stream_id" => quarter_stream_id * 4, "sending_mode" => ?substrate, "size" => len, "maximum" => maximum);
+                    log::debug!("Dropping oversized target datagram"; "target" => %target, "connection_id" => connection_id, "stream_id" => quarter_stream_id * 4, "sending_mode" => ?substrate, "size" => len, "maximum" => maximum);
                     continue;
                 }
                 let frame = match substrate {
@@ -693,35 +661,6 @@ mod tests {
         assert_eq!(diagnostic_header(&headers, b":protocol"), "<missing>");
     }
 
-    #[tokio::test]
-    async fn health_check_accepts_without_target_or_datagram_channels() {
-        let (outgoing, mut response) = tokio::sync::mpsc::channel(4);
-        let (incoming, request) = tokio::sync::mpsc::channel(4);
-        let task = tokio::spawn(serve_health_check(
-            OutboundFrameSender::new(outgoing),
-            request,
-        ));
-        let Some(OutboundFrame::Headers(headers, _)) = response.recv().await else {
-            panic!("health check did not return headers");
-        };
-        assert!(headers
-            .iter()
-            .any(|h| h.name() == b":status" && h.value() == b"200"));
-        assert!(headers
-            .iter()
-            .any(|h| h.name() == b"capsule-protocol" && h.value() == b"?1"));
-        assert!(response.try_recv().is_err());
-        incoming
-            .send(InboundFrame::Body(Default::default(), true))
-            .await
-            .unwrap();
-        task.await.unwrap();
-        assert!(
-            matches!(response.recv().await, Some(OutboundFrame::Body(body, true)) if body.is_empty())
-        );
-        assert!(response.recv().await.is_none());
-    }
-
     #[test]
     fn both_tunnel_types_apply_the_same_default_and_custom_port_policy() {
         use crate::{
@@ -788,13 +727,25 @@ mod tests {
             }
         }
         assert_eq!(
-            request_target(&[Header::new(b":method", b"GET")], &[ConnectPort::All]),
-            Err(b"405".as_slice())
-        );
-        assert_eq!(
             request_target(&[Header::new(b":method", b"CONNECT")], &[ConnectPort::All]),
             Err(b"400".as_slice())
         );
+    }
+
+    #[test]
+    fn health_requests_are_not_forwarded() {
+        for method in [b"GET".as_slice(), b"HEAD"] {
+            let headers = [
+                Header::new(b":method", method),
+                Header::new(b":scheme", b"https"),
+                Header::new(b":authority", b"relay.example:4431"),
+                Header::new(b":path", b"/health"),
+            ];
+            assert_eq!(
+                request_target(&headers, &[ConnectPort::All]),
+                Err(b"405".as_slice())
+            );
+        }
     }
 
     #[test]
