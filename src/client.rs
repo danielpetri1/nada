@@ -439,7 +439,7 @@ async fn establish_tunnel(
         let commands = controller.h3_cmd_sender();
         let tunnel = TcpTunnel::new(
             request.target,
-            stream_id,
+            headers.h3_audit_stats,
             headers.send,
             headers.recv,
             headers.read_fin,

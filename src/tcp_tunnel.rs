@@ -5,15 +5,18 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::watch,
 };
+use tokio_quiche::datagram_socket::StreamClosureKind;
 use tokio_quiche::http3::driver::{
     InboundFrame, InboundFrameStream, OutboundFrame, OutboundFrameSender,
 };
+use tokio_quiche::http3::H3AuditStats;
 use tokio_quiche::{buf_factory::BufFactory, quiche::BufFactory as _};
 
 const WRITE_CHUNK: usize = 16_384;
@@ -61,7 +64,7 @@ impl Failure {
 /// One CONNECT tunnel to a TCP target.
 pub struct TcpTunnel {
     target: SocketAddr,
-    stream_id: u64,
+    audit: Arc<H3AuditStats>,
     send: OutboundFrameSender,
     recv: InboundFrameStream,
     buffered: Vec<u8>,
@@ -78,12 +81,12 @@ impl TcpTunnel {
         self.target
     }
     pub fn stream_id(&self) -> u64 {
-        self.stream_id
+        self.audit.stream_id()
     }
 
     pub(crate) fn new(
         target: SocketAddr,
-        stream_id: u64,
+        audit: Arc<H3AuditStats>,
         send: OutboundFrameSender,
         recv: InboundFrameStream,
         read_fin: bool,
@@ -92,7 +95,7 @@ impl TcpTunnel {
     ) -> Self {
         Self {
             target,
-            stream_id,
+            audit,
             send,
             recv,
             read_fin,
@@ -140,10 +143,19 @@ impl AsyncRead for TcpTunnel {
                     )))
                 }
                 None => {
+                    // The driver can close a full body channel before it queues FIN.
+                    // Only recover an explicit FIN after draining all queued DATA.
+                    if this.audit.recvd_stream_fin() == StreamClosureKind::Explicit
+                        && this.audit.recvd_reset_stream_error_code() < 0
+                        && this.audit.sent_stop_sending_error_code() < 0
+                    {
+                        this.read_fin = true;
+                        return Poll::Ready(Ok(()));
+                    }
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "CONNECT stream ended without FIN",
-                    )))
+                    )));
                 }
             }
         }
@@ -222,6 +234,7 @@ mod tests {
         send: mpsc::Sender<InboundFrame>,
         recv: mpsc::Receiver<OutboundFrame>,
         state: watch::Sender<TunnelState>,
+        audit: Arc<H3AuditStats>,
         cancelled: Arc<AtomicUsize>,
     }
 
@@ -229,12 +242,13 @@ mod tests {
         let (outgoing, recv) = mpsc::channel(capacity);
         let (send, incoming) = mpsc::channel(capacity);
         let (state, status) = watch::channel(TunnelState::Open);
+        let audit = Arc::new(H3AuditStats::new(4));
         let cancelled = Arc::new(AtomicUsize::new(0));
         let count = cancelled.clone();
         (
             TcpTunnel::new(
                 "1.1.1.1:53".parse().unwrap(),
-                4,
+                audit.clone(),
                 OutboundFrameSender::new(outgoing),
                 incoming,
                 false,
@@ -247,9 +261,30 @@ mod tests {
                 send,
                 recv,
                 state,
+                audit,
                 cancelled,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn drains_queued_data_when_driver_records_fin_without_queueing_it() {
+        let (mut tunnel, peer) = tunnel(1);
+        peer.send
+            .try_send(InboundFrame::Body(
+                BufFactory::buf_from_slice(b"last bytes").into(),
+                false,
+            ))
+            .unwrap();
+        peer.audit.set_recvd_stream_fin(StreamClosureKind::Explicit);
+        drop(peer.send);
+
+        let mut received = Vec::new();
+        tunnel.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"last bytes");
+        tunnel.shutdown().await.unwrap();
+        drop(tunnel);
+        assert_eq!(peer.cancelled.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -395,6 +430,9 @@ mod tests {
     async fn missing_fin_is_an_error_and_drop_cancels_only_that_tunnel() {
         let (mut first, first_peer) = tunnel(1);
         let (mut second, second_peer) = tunnel(1);
+        first_peer
+            .audit
+            .set_recvd_stream_fin(StreamClosureKind::Implicit);
         drop(first_peer.send);
         assert_eq!(
             first.read(&mut [0]).await.unwrap_err().kind(),
@@ -404,5 +442,17 @@ mod tests {
         assert_eq!(first_peer.cancelled.load(Ordering::SeqCst), 1);
         second.write_all(b"unaffected").await.unwrap();
         assert_eq!(second_peer.cancelled.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recorded_fin_does_not_mask_a_reset() {
+        let (mut tunnel, peer) = tunnel(1);
+        peer.audit.set_recvd_stream_fin(StreamClosureKind::Explicit);
+        peer.audit.set_recvd_reset_stream_error_code(0);
+        drop(peer.send);
+        assert_eq!(
+            tunnel.read(&mut [0]).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }

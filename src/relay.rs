@@ -24,8 +24,9 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{lookup_host, TcpStream, UdpSocket},
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -34,6 +35,7 @@ use tokio_quiche::http3::driver::{
     ServerH3Event, StreamShutdown,
 };
 use tokio_quiche::http3::settings::Http3Settings;
+use tokio_quiche::http3::H3AuditStats;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::QuicCommand;
 use tokio_quiche::quiche::h3::{Header, NameValue, WireErrorCode};
@@ -351,7 +353,7 @@ async fn handle_connection(
                         peer_datagrams = settings.contains(&(SETTINGS_H3_DATAGRAM, 1));
                     }
                     ServerH3Event::Core(H3Event::NewFlow { flow_id: quarter_stream_id, send, recv }) => { datagram_channels.insert(quarter_stream_id, (send, recv)); }
-                    ServerH3Event::Headers { incoming_headers: IncomingH3Headers { stream_id, headers, mut send, recv, read_fin, .. }, .. } => {
+                    ServerH3Event::Headers { incoming_headers: IncomingH3Headers { stream_id, headers, mut send, recv, read_fin, h3_audit_stats }, .. } => {
                         let request = RequestDiagnostics::new(diagnostics, stream_id, headers);
                         let headers = &request.headers;
                         let value = |name: &[u8]| headers.iter().find(|h| h.name() == name).map(|h| h.value());
@@ -362,6 +364,7 @@ async fn handle_connection(
                                 let priority = parse_raw_priority(value(b"priority").map(|p| p.to_vec()));
                                 let commands = controller.h3_cmd_sender();
                                 let tunnel_connection_id = connection_id.clone();
+                                let audit = h3_audit_stats.clone();
                                 // Resolve and connect without blocking other streams on this connection.
                                 let handle = tasks.spawn(async move {
                                     let (mut socket, target) = match timeout(connect_timeout, TcpTarget::connect(destination)).await {
@@ -379,23 +382,45 @@ async fn handle_connection(
                                     if send.send(OutboundFrame::Headers(vec![Header::new(b":status", b"200")], priority)).await.is_err() {
                                         return stream_id;
                                     }
+                                    let Some(outbound) = send.get_ref().cloned() else { return stream_id; };
                                     let (_state, status) = watch::channel(TunnelState::Open);
-                                    let mut tunnel = TcpTunnel::new(target, stream_id, send, recv, read_fin, status, move || {
+                                    let mut tunnel = TcpTunnel::new(target, audit.clone(), send, recv, read_fin, status, move || {
                                         let _ = commands.send(H3Command::ShutdownStream {
                                             stream_id,
                                             shutdown: StreamShutdown::Both { read_error_code: WireErrorCode::ConnectError as u64, write_error_code: WireErrorCode::ConnectError as u64 },
                                         });
                                     });
                                     log::debug!("TCP tunnel established"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id);
-                                    match tokio::io::copy_bidirectional(&mut socket.socket, &mut tunnel).await {
-                                        Ok(_) => socket.finished = true,
-                                        Err(error) => {
-                                            log::debug!("TCP tunnel stopped"; "target" => %target, "connection_id" => %tunnel_connection_id, "stream_id" => stream_id, "error" => %error);
+                                    match forward_tcp(&mut socket.socket, &mut tunnel, &outbound, &audit).await {
+                                        Ok((client_to_target, target_to_client)) => {
+                                            socket.finished = true;
+                                            log::debug!("TCP tunnel closed";
+                                                "target" => %target,
+                                                "connection_id" => %tunnel_connection_id,
+                                                "stream_id" => stream_id,
+                                                "client_to_target_bytes" => client_to_target,
+                                                "target_to_client_bytes" => target_to_client,
+                                            );
+                                        }
+                                        Err((direction, error)) => {
+                                            log::debug!("TCP tunnel stopped";
+                                                "target" => %target,
+                                                "connection_id" => %tunnel_connection_id,
+                                                "stream_id" => stream_id,
+                                                "direction" => direction,
+                                                "error" => %error,
+                                                "peer_fin" => ?audit.recvd_stream_fin(),
+                                                "local_fin" => ?audit.sent_stream_fin(),
+                                                "peer_reset" => ?u64::try_from(audit.recvd_reset_stream_error_code()).ok(),
+                                                "local_reset" => ?u64::try_from(audit.sent_reset_stream_error_code()).ok(),
+                                                "peer_stop_sending" => ?u64::try_from(audit.recvd_stop_sending_error_code()).ok(),
+                                                "local_stop_sending" => ?u64::try_from(audit.sent_stop_sending_error_code()).ok(),
+                                            );
                                         }
                                     }
                                     stream_id
                                 });
-                                running.insert(stream_id, (handle, true));
+                                running.insert(stream_id, (handle, Some(h3_audit_stats)));
                                 continue;
                             }
                             Err(status) => {
@@ -488,18 +513,31 @@ async fn handle_connection(
                             let _ = commands.send(H3Command::ShutdownStream { stream_id, shutdown: StreamShutdown::Both { read_error_code: 0, write_error_code: 0 } });
                             stream_id
                         });
-                        running.insert(stream_id, (handle, false));
+                        running.insert(stream_id, (handle, None));
                     }
                     ServerH3Event::Core(H3Event::ResetStream { stream_id }) => {
                         datagram_channels.remove(&(stream_id / 4));
-                        if let Some((handle, _)) = running.remove(&stream_id) { handle.abort(); }
+                        if let Some((handle, audit)) = running.remove(&stream_id) {
+                            if let Some(audit) = audit {
+                                log::debug!("TCP CONNECT reset by client";
+                                    "connection_id" => %connection_id,
+                                    "stream_id" => stream_id,
+                                    "direction" => "client_to_target",
+                                    "peer_fin" => ?audit.recvd_stream_fin(),
+                                    "local_fin" => ?audit.sent_stream_fin(),
+                                    "peer_reset" => ?u64::try_from(audit.recvd_reset_stream_error_code()).ok(),
+                                    "peer_stop_sending" => ?u64::try_from(audit.recvd_stop_sending_error_code()).ok(),
+                                );
+                            }
+                            handle.abort();
+                        }
                         controller.shutdown_stream(stream_id, StreamShutdown::Both { read_error_code: WireErrorCode::ConnectError as u64, write_error_code: WireErrorCode::ConnectError as u64 });
                     }
                     ServerH3Event::Core(H3Event::StreamClosed { stream_id }) => {
                         datagram_channels.remove(&(stream_id / 4));
                         // TCP workers must drain queued bytes/FIN to the target.
-                        if let Some((handle, tcp)) = running.remove(&stream_id) {
-                            if !tcp { handle.abort(); }
+                        if let Some((handle, None)) = running.remove(&stream_id) {
+                            handle.abort();
                         }
                     }
                     ServerH3Event::Core(H3Event::ConnectionError(error)) => {
@@ -524,6 +562,56 @@ async fn handle_connection(
     // the close record includes peer/local codes and transport-only failures.
     while controller.event_receiver_mut().recv().await.is_some() {}
     closure
+}
+
+type TcpCopyError = (&'static str, io::Error);
+
+async fn forward_tcp(
+    target: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    tunnel: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    outbound: &mpsc::Sender<OutboundFrame>,
+    audit: &H3AuditStats,
+) -> Result<(u64, u64), TcpCopyError> {
+    let (target_read, target_write) = tokio::io::split(target);
+    let (tunnel_read, tunnel_write) = tokio::io::split(tunnel);
+    let transfer = async {
+        tokio::try_join!(
+            copy_tcp_direction(tunnel_read, target_write, "client_to_target"),
+            copy_tcp_direction(target_read, tunnel_write, "target_to_client"),
+        )
+    };
+    let peer_stopped_reading = async {
+        outbound.closed().await;
+        // A normal outbound FIN also closes this channel. Keep forwarding in
+        // the other direction unless the driver recorded STOP_SENDING.
+        if audit.recvd_stop_sending_error_code() < 0 {
+            std::future::pending::<()>().await;
+        }
+        Err((
+            "target_to_client",
+            io::Error::new(io::ErrorKind::ConnectionAborted, "client sent STOP_SENDING"),
+        ))
+    };
+    tokio::select! {
+        biased;
+        result = peer_stopped_reading => result,
+        result = transfer => result,
+    }
+}
+
+async fn copy_tcp_direction(
+    mut reader: impl AsyncRead + Unpin,
+    mut writer: impl AsyncWrite + Unpin,
+    direction: &'static str,
+) -> Result<u64, TcpCopyError> {
+    let bytes = tokio::io::copy(&mut reader, &mut writer)
+        .await
+        .map_err(|error| (direction, error))?;
+    writer
+        .shutdown()
+        .await
+        .map_err(|error| (direction, error))?;
+    Ok(bytes)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -677,6 +765,56 @@ async fn relay_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{duplex, AsyncReadExt};
+
+    #[tokio::test]
+    async fn client_stop_sending_ends_an_idle_tcp_tunnel() {
+        let (mut target, _target_peer) = duplex(64);
+        let (mut tunnel, _tunnel_peer) = duplex(64);
+        let (outbound, driver) = mpsc::channel(1);
+        let audit = H3AuditStats::new(0);
+        let mut forwarding =
+            std::pin::pin!(forward_tcp(&mut target, &mut tunnel, &outbound, &audit));
+        assert!(futures::poll!(&mut forwarding).is_pending());
+
+        audit.set_recvd_stop_sending_error_code(0);
+        drop(driver);
+        let std::task::Poll::Ready(Err((direction, error))) = futures::poll!(&mut forwarding)
+        else {
+            panic!("STOP_SENDING did not end the idle copy");
+        };
+        assert_eq!(direction, "target_to_client");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn outbound_fin_preserves_client_to_target_copy() {
+        let (mut target, mut target_peer) = duplex(64);
+        let (mut tunnel, mut tunnel_peer) = duplex(64);
+        let (outbound, driver) = mpsc::channel(1);
+        let audit = H3AuditStats::new(0);
+        let mut forwarding =
+            std::pin::pin!(forward_tcp(&mut target, &mut tunnel, &outbound, &audit));
+
+        target_peer.shutdown().await.unwrap();
+        assert!(futures::poll!(&mut forwarding).is_pending());
+        assert!(matches!(
+            futures::poll!(Box::pin(tunnel_peer.read(&mut [0]))),
+            std::task::Poll::Ready(Ok(0))
+        ));
+        drop(driver);
+        assert!(futures::poll!(&mut forwarding).is_pending());
+
+        tunnel_peer.write_all(b"after FIN").await.unwrap();
+        tunnel_peer.shutdown().await.unwrap();
+        assert!(matches!(
+            futures::poll!(&mut forwarding),
+            std::task::Poll::Ready(Ok((9, 0)))
+        ));
+        let mut received = Vec::new();
+        target_peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"after FIN");
+    }
 
     #[tokio::test]
     async fn active_connections_are_released_on_completion_and_cancellation() {
